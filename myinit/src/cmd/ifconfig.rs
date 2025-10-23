@@ -337,7 +337,31 @@ fn set_interface_ipv4(iface_name: &str, ip: &str, netmask: &str) -> Result<(), S
     }
 
     println!("Successfully set IPv4 address on {}", iface_name);
+
+    // Add connected route for the network
+    // Calculate network address from IP and netmask
+    let network = Ipv4Addr::from(u32::from(ip_addr) & u32::from(netmask_addr));
+    let prefix_len = netmask_to_prefix_len(netmask_addr);
+
+    // Add the route using netlink
+    if let Err(e) = add_connected_route_v4(network, prefix_len, iface_name) {
+        eprintln!("Warning: Failed to add connected route: {}", e);
+    }
+
     Ok(())
+}
+
+fn netmask_to_prefix_len(mask: Ipv4Addr) -> u8 {
+    u32::from(mask).count_ones() as u8
+}
+
+fn add_connected_route_v4(network: Ipv4Addr, prefix: u8, iface: &str) -> Result<(), String> {
+    // Use the ip route add functionality to add the connected route
+    // This is similar to what happens in ip.rs but we need to call it from here
+    use crate::cmd::ip::add_route_internal_v4;
+
+    // Add route without gateway (direct/connected route)
+    add_route_internal_v4(network, prefix, None, Some(iface))
 }
 
 fn set_interface_ipv6(iface_name: &str, ip: &str, prefix_len: u8) -> Result<(), String> {

@@ -236,7 +236,7 @@ fn add_ipv4_route(args: &[&str]) {
         }
     }
 
-    if let Err(e) = add_ipv4_route_internal(network, prefix, gateway, device) {
+    if let Err(e) = add_route_internal_v4(network, prefix, gateway, device) {
         eprintln!("Failed to add route: {}", e);
     } else {
         println!("Route added successfully");
@@ -332,8 +332,10 @@ fn parse_hex_ip(hex: &str) -> Ipv4Addr {
     }
 
     let val = u32::from_str_radix(hex, 16).unwrap_or(0);
-    // Note: /proc/net/route uses little-endian format
-    Ipv4Addr::from(val.to_le())
+    // Note: /proc/net/route uses little-endian hex format
+    // So we need to convert: 0001A8C0 -> C0 A8 01 00 -> 192.168.1.0
+    let bytes = val.to_le_bytes();
+    Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
 fn parse_hex_ipv6(hex: &str) -> Ipv6Addr {
@@ -381,34 +383,145 @@ fn parse_cidr_v6(cidr: &str) -> (Ipv6Addr, u8) {
 // Route manipulation via rtnetlink (netlink sockets)
 // These use NETLINK_ROUTE to manipulate the routing table
 
-fn add_ipv4_route_internal(
+// Netlink constants
+const NETLINK_ROUTE: i32 = 0;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_ACK: u16 = 4;
+const NLM_F_CREATE: u16 = 0x400;
+const NLM_F_EXCL: u16 = 0x200;
+
+const RTA_DST: u16 = 1;
+const RTA_GATEWAY: u16 = 5;
+const RTA_OIF: u16 = 4;
+
+const RTN_UNICAST: u8 = 1;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
+const RTPROT_BOOT: u8 = 3;
+const RT_TABLE_MAIN: u8 = 254;
+
+#[repr(C)]
+struct nlmsghdr {
+    nlmsg_len: u32,
+    nlmsg_type: u16,
+    nlmsg_flags: u16,
+    nlmsg_seq: u32,
+    nlmsg_pid: u32,
+}
+
+#[repr(C)]
+struct rtmsg {
+    rtm_family: u8,
+    rtm_dst_len: u8,
+    rtm_src_len: u8,
+    rtm_tos: u8,
+    rtm_table: u8,
+    rtm_protocol: u8,
+    rtm_scope: u8,
+    rtm_type: u8,
+    rtm_flags: u32,
+}
+
+#[repr(C)]
+struct rtattr {
+    rta_len: u16,
+    rta_type: u16,
+}
+
+// Make this public so other modules (like ifconfig) can use it
+pub fn add_route_internal_v4(
     dest: Ipv4Addr,
     prefix: u8,
     gateway: Option<Ipv4Addr>,
     device: Option<&str>,
 ) -> Result<(), String> {
-    // This is a simplified implementation using /proc/sys/net manipulation
-    // For a full implementation, we would use NETLINK_ROUTE sockets
+    let sock = create_netlink_socket()?;
 
-    // Build route command string
-    let mut cmd = format!("route add -net {} netmask {}",
-        dest,
-        prefix_to_netmask_v4(prefix));
+    // Get interface index if device specified
+    let if_index = if let Some(dev) = device {
+        match get_interface_index(dev) {
+            Some(idx) => Some(idx as u32),
+            None => return Err(format!("Interface {} not found", dev)),
+        }
+    } else {
+        None
+    };
 
+    // Build netlink message
+    let mut msg = Vec::new();
+
+    // Netlink header
+    let nlh = nlmsghdr {
+        nlmsg_len: 0, // Will calculate later
+        nlmsg_type: RTM_NEWROUTE,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    // Route message
+    let rtm = rtmsg {
+        rtm_family: libc::AF_INET as u8,
+        rtm_dst_len: prefix,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: if gateway.is_some() { RT_SCOPE_UNIVERSE } else { RT_SCOPE_LINK },
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    };
+
+    // Add headers to message
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &rtm as *const rtmsg as *const u8,
+            std::mem::size_of::<rtmsg>(),
+        )
+    });
+
+    // Add RTA_DST attribute (destination network)
+    // For IPv4, addresses should be in network byte order (big-endian)
+    if dest != Ipv4Addr::new(0, 0, 0, 0) || prefix != 0 {
+        add_rta_attr(&mut msg, RTA_DST, &dest.octets());
+    }
+
+    // Add RTA_GATEWAY attribute if specified
     if let Some(gw) = gateway {
-        cmd.push_str(&format!(" gw {}", gw));
+        add_rta_attr(&mut msg, RTA_GATEWAY, &gw.octets());
     }
 
-    if let Some(dev) = device {
-        cmd.push_str(&format!(" dev {}", dev));
+    // For direct routes without gateway, we need the device
+    if gateway.is_none() && if_index.is_none() {
+        unsafe { libc::close(sock); }
+        return Err("Either gateway or device must be specified".to_string());
     }
 
-    // Note: This requires the 'route' command which we don't have
-    // Instead, we'll return an informational error
-    Err(format!(
-        "Route manipulation requires netlink support. Would execute: {}",
-        cmd
-    ))
+    // Add RTA_OIF attribute (output interface) if specified
+    if let Some(idx) = if_index {
+        add_rta_attr(&mut msg, RTA_OIF, &idx.to_ne_bytes());
+    }
+
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
 }
 
 fn add_ipv6_route_internal(
@@ -417,44 +530,346 @@ fn add_ipv6_route_internal(
     gateway: Option<Ipv6Addr>,
     device: Option<&str>,
 ) -> Result<(), String> {
-    // Similar to IPv4, this would require NETLINK_ROUTE
-    let mut cmd = format!("route -A inet6 add {}/{}", dest, prefix);
+    let sock = create_netlink_socket()?;
 
+    // Get interface index if device specified
+    let if_index = if let Some(dev) = device {
+        match get_interface_index(dev) {
+            Some(idx) => Some(idx as u32),
+            None => return Err(format!("Interface {} not found", dev)),
+        }
+    } else {
+        None
+    };
+
+    // Build netlink message
+    let mut msg = Vec::new();
+
+    // Netlink header
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_NEWROUTE,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    // Route message
+    let rtm = rtmsg {
+        rtm_family: libc::AF_INET6 as u8,
+        rtm_dst_len: prefix,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: if gateway.is_some() { RT_SCOPE_UNIVERSE } else { RT_SCOPE_LINK },
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &rtm as *const rtmsg as *const u8,
+            std::mem::size_of::<rtmsg>(),
+        )
+    });
+
+    // Add RTA_DST attribute
+    if dest != Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0) || prefix != 0 {
+        add_rta_attr(&mut msg, RTA_DST, &dest.octets());
+    }
+
+    // Add RTA_GATEWAY attribute if specified
     if let Some(gw) = gateway {
-        cmd.push_str(&format!(" gw {}", gw));
+        add_rta_attr(&mut msg, RTA_GATEWAY, &gw.octets());
     }
 
-    if let Some(dev) = device {
-        cmd.push_str(&format!(" dev {}", dev));
+    // Add RTA_OIF attribute if specified
+    if let Some(idx) = if_index {
+        add_rta_attr(&mut msg, RTA_OIF, &idx.to_ne_bytes());
     }
 
-    Err(format!(
-        "Route manipulation requires netlink support. Would execute: {}",
-        cmd
-    ))
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
 }
 
 fn del_ipv4_route_internal(dest: Ipv4Addr, prefix: u8) -> Result<(), String> {
-    Err(format!(
-        "Route deletion requires netlink support. Would delete: {}/{}",
-        dest, prefix
-    ))
+    let sock = create_netlink_socket()?;
+
+    // Build netlink message
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_DELROUTE,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let rtm = rtmsg {
+        rtm_family: libc::AF_INET as u8,
+        rtm_dst_len: prefix,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: RT_SCOPE_UNIVERSE,
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &rtm as *const rtmsg as *const u8,
+            std::mem::size_of::<rtmsg>(),
+        )
+    });
+
+    // Add RTA_DST attribute
+    if dest != Ipv4Addr::new(0, 0, 0, 0) || prefix != 0 {
+        add_rta_attr(&mut msg, RTA_DST, &dest.octets());
+    }
+
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
 }
 
 fn del_ipv6_route_internal(dest: Ipv6Addr, prefix: u8) -> Result<(), String> {
-    Err(format!(
-        "Route deletion requires netlink support. Would delete: {}/{}",
-        dest, prefix
-    ))
+    let sock = create_netlink_socket()?;
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_DELROUTE,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let rtm = rtmsg {
+        rtm_family: libc::AF_INET6 as u8,
+        rtm_dst_len: prefix,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: RT_SCOPE_UNIVERSE,
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &rtm as *const rtmsg as *const u8,
+            std::mem::size_of::<rtmsg>(),
+        )
+    });
+
+    // Add RTA_DST attribute
+    if dest != Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0) || prefix != 0 {
+        add_rta_attr(&mut msg, RTA_DST, &dest.octets());
+    }
+
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
 }
 
-fn prefix_to_netmask_v4(prefix: u8) -> Ipv4Addr {
-    let mask = if prefix == 0 {
-        0u32
-    } else {
-        !0u32 << (32 - prefix)
+// Netlink helper functions
+
+fn create_netlink_socket() -> Result<i32, String> {
+    let sock = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_ROUTE) };
+
+    if sock < 0 {
+        return Err("Failed to create netlink socket".to_string());
+    }
+
+    // Bind socket
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as u16;
+    addr.nl_pid = 0; // Kernel
+    addr.nl_groups = 0;
+
+    let bind_result = unsafe {
+        libc::bind(
+            sock,
+            &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_nl>() as u32,
+        )
     };
-    Ipv4Addr::from(mask)
+
+    if bind_result < 0 {
+        unsafe { libc::close(sock); }
+        return Err("Failed to bind netlink socket".to_string());
+    }
+
+    Ok(sock)
+}
+
+fn add_rta_attr(msg: &mut Vec<u8>, rta_type: u16, data: &[u8]) {
+    let rta_len = (std::mem::size_of::<rtattr>() + data.len()) as u16;
+    let rta = rtattr {
+        rta_len: rta_len,
+        rta_type: rta_type,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &rta as *const rtattr as *const u8,
+            std::mem::size_of::<rtattr>(),
+        )
+    });
+    msg.extend_from_slice(data);
+
+    // Align to 4 bytes
+    while msg.len() % 4 != 0 {
+        msg.push(0);
+    }
+}
+
+fn send_netlink_message(sock: i32, msg: &[u8]) -> Result<(), String> {
+    let result = unsafe {
+        libc::send(
+            sock,
+            msg.as_ptr() as *const libc::c_void,
+            msg.len(),
+            0,
+        )
+    };
+
+    if result < 0 {
+        return Err("Failed to send netlink message".to_string());
+    }
+
+    Ok(())
+}
+
+fn receive_netlink_ack(sock: i32) -> Result<(), String> {
+    let mut buffer = vec![0u8; 4096];
+
+    let result = unsafe {
+        libc::recv(
+            sock,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len(),
+            0,
+        )
+    };
+
+    if result < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(format!("Failed to receive netlink response (errno: {})", errno));
+    }
+
+    let len = result as usize;
+    if len < std::mem::size_of::<nlmsghdr>() {
+        return Err(format!("Invalid netlink response (too short: {} bytes)", len));
+    }
+
+    let nlh = unsafe { &*(buffer.as_ptr() as *const nlmsghdr) };
+
+    // Debug: print message type
+    eprintln!("DEBUG: Received netlink message type: {}", nlh.nlmsg_type);
+
+    // Check for error message (NLMSG_ERROR = 2)
+    if nlh.nlmsg_type == 2 {
+        // Error message contains an error code after the header
+        if len >= std::mem::size_of::<nlmsghdr>() + 4 {
+            let error_code = unsafe {
+                *(buffer.as_ptr().add(std::mem::size_of::<nlmsghdr>()) as *const i32)
+            };
+
+            eprintln!("DEBUG: Error code from kernel: {}", error_code);
+
+            if error_code != 0 {
+                let errno = -error_code;
+                let error_msg = unsafe {
+                    let err_str = libc::strerror(errno);
+                    std::ffi::CStr::from_ptr(err_str)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                return Err(format!("Netlink error: {} (errno: {})", error_msg, errno));
+            } else {
+                eprintln!("DEBUG: Successful ACK (error_code == 0)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn get_interface_index(iface_name: &str) -> Option<i32> {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return None;
+    }
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let iface_bytes = iface_name.as_bytes();
+    let copy_len = iface_bytes.len().min(libc::IFNAMSIZ - 1);
+
+    for i in 0..copy_len {
+        ifr.ifr_name[i] = iface_bytes[i] as i8;
+    }
+
+    let result = unsafe { libc::ioctl(sock, libc::SIOCGIFINDEX as i32, &mut ifr) };
+    unsafe { libc::close(sock); }
+
+    if result == 0 {
+        Some(unsafe { ifr.ifr_ifru.ifru_ifindex })
+    } else {
+        None
+    }
 }
 
 pub fn help_text() -> &'static str {
