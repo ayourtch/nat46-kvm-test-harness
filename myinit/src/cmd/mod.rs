@@ -49,6 +49,7 @@ define_commands! {
     ls,
     mknod,
     mount,
+    netcat,
     ping,
     poweroff,
     ps,
