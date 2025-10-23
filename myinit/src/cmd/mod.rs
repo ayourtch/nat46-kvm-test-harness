@@ -39,6 +39,7 @@ macro_rules! define_commands {
 // Define all commands here - adding a new command is just adding it to this list!
 define_commands! {
     cat,
+    capture,
     dmesg,
     echo,
     help,
