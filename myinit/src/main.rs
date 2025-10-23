@@ -73,31 +73,99 @@ fn restore_stdout(saved_stdout: i32, file_fd: i32) {
     io::stdout().flush().ok();
 }
 
+fn redirect_stdin_from_file(file_path: &str) -> Result<(i32, i32), String> {
+    // Save original stdin
+    let saved_stdin = unsafe { libc::dup(0) };
+    if saved_stdin < 0 {
+        return Err("Failed to duplicate stdin".to_string());
+    }
+
+    // Open the input file
+    let file = OpenOptions::new()
+        .read(true)
+        .open(file_path)
+        .map_err(|e| format!("Failed to open {}: {}", file_path, e))?;
+
+    let fd = file.as_raw_fd();
+
+    // Redirect stdin from the file
+    if unsafe { libc::dup2(fd, 0) } < 0 {
+        unsafe { libc::close(saved_stdin); }
+        return Err("Failed to redirect stdin".to_string());
+    }
+
+    // Keep the file open by forgetting it
+    std::mem::forget(file);
+
+    Ok((saved_stdin, fd))
+}
+
+fn restore_stdin(saved_stdin: i32, file_fd: i32) {
+    // Restore original stdin
+    unsafe {
+        libc::dup2(saved_stdin, 0);
+        libc::close(saved_stdin);
+        libc::close(file_fd);
+    }
+}
+
 fn execute_command(command: &str, args: &str) -> bool {
     cmd::execute(command, args)
 }
 
-// Parse and execute a full command line (supports output redirection)
+// Parse and execute a full command line (supports input and output redirection)
 fn execute_line(line: &str) {
-    // Check for output redirection
-    let (cmd_part, redirect_file) = if let Some(pos) = line.find('>') {
+    // Check for input redirection first
+    let (cmd_line, input_file) = if let Some(pos) = line.find('<') {
         let cmd = line[..pos].trim();
         let file = line[pos + 1..].trim();
-        (cmd, Some(file))
+        // Extract just the filename (stop at > if present)
+        let input_filename = if let Some(out_pos) = file.find('>') {
+            file[..out_pos].trim()
+        } else {
+            file
+        };
+        (cmd, Some(input_filename))
     } else {
         (line, None)
+    };
+
+    // Check for output redirection
+    let (cmd_part, output_file) = if let Some(pos) = cmd_line.find('>') {
+        let cmd = cmd_line[..pos].trim();
+        let file = cmd_line[pos + 1..].trim();
+        (cmd, Some(file))
+    } else {
+        (cmd_line, None)
     };
 
     let parts: Vec<&str> = cmd_part.splitn(2, ' ').collect();
     let command = parts[0];
     let args = if parts.len() > 1 { parts[1] } else { "" };
 
+    // Handle input redirection
+    let input_redirect_info = if let Some(file_path) = input_file {
+        match redirect_stdin_from_file(file_path) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("Input redirection error: {}", e);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // Handle output redirection
-    let redirect_info = if let Some(file_path) = redirect_file {
+    let output_redirect_info = if let Some(file_path) = output_file {
         match redirect_stdout_to_file(file_path) {
             Ok(info) => Some(info),
             Err(e) => {
-                eprintln!("Redirection error: {}", e);
+                eprintln!("Output redirection error: {}", e);
+                // Restore stdin if it was redirected
+                if let Some((saved_stdin, file_fd)) = input_redirect_info {
+                    restore_stdin(saved_stdin, file_fd);
+                }
                 return;
             }
         }
@@ -109,8 +177,13 @@ fn execute_line(line: &str) {
     execute_command(command, args);
 
     // Restore stdout if it was redirected
-    if let Some((saved_stdout, file_fd)) = redirect_info {
+    if let Some((saved_stdout, file_fd)) = output_redirect_info {
         restore_stdout(saved_stdout, file_fd);
+    }
+
+    // Restore stdin if it was redirected
+    if let Some((saved_stdin, file_fd)) = input_redirect_info {
+        restore_stdin(saved_stdin, file_fd);
     }
 }
 
@@ -148,41 +221,14 @@ fn interactive_shell() {
                     continue;
                 }
 
-                // Check for output redirection
-                let (cmd_part, redirect_file) = if let Some(pos) = input.find('>') {
-                    let cmd = input[..pos].trim();
-                    let file = input[pos + 1..].trim();
-                    (cmd, Some(file))
-                } else {
-                    (input, None)
-                };
+                // Check if command should cause exit (before redirections)
+                let base_cmd = input.split_whitespace().next().unwrap_or("");
 
-                let parts: Vec<&str> = cmd_part.splitn(2, ' ').collect();
-                let command = parts[0];
-                let args = if parts.len() > 1 { parts[1] } else { "" };
+                // Use execute_line for full redirection support
+                execute_line(input);
 
-                // Handle output redirection
-                let redirect_info = if let Some(file_path) = redirect_file {
-                    match redirect_stdout_to_file(file_path) {
-                        Ok(info) => Some(info),
-                        Err(e) => {
-                            eprintln!("Redirection error: {}", e);
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Execute the command
-                let should_exit = execute_command(command, args);
-
-                // Restore stdout if it was redirected
-                if let Some((saved_stdout, file_fd)) = redirect_info {
-                    restore_stdout(saved_stdout, file_fd);
-                }
-
-                if should_exit {
+                // Check if we should exit
+                if base_cmd == "poweroff" {
                     break; // Exit shell
                 }
             }
