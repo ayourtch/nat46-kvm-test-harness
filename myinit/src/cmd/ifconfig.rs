@@ -183,6 +183,9 @@ fn print_interface_info(iface_name: &str) {
 
     // Get IPv6 addresses by reading /proc/net/if_inet6
     print_ipv6_addresses(iface_name);
+
+    // Print interface statistics from /proc/net/dev
+    print_interface_stats(iface_name);
 }
 
 fn print_ipv6_addresses(iface_name: &str) {
@@ -219,6 +222,66 @@ fn print_ipv6_addresses(iface_name: &str) {
                             let ipv6_addr = ipv6_parts.join(":");
                             println!("  inet6 addr: {}/{}", ipv6_addr, prefix_len);
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_interface_stats(iface_name: &str) {
+    // Read /proc/net/dev for interface statistics
+    // Format (after 2 header lines):
+    // interface: RX bytes packets errs drop fifo frame compressed multicast TX bytes packets errs drop fifo colls carrier compressed
+
+    if let Ok(file) = File::open("/proc/net/dev") {
+        let reader = BufReader::new(file);
+
+        for (i, line) in reader.lines().enumerate() {
+            if let Ok(line) = line {
+                // Skip the first two header lines
+                if i < 2 {
+                    continue;
+                }
+
+                // Parse interface name and statistics
+                if let Some(colon_pos) = line.find(':') {
+                    let iface = line[..colon_pos].trim();
+
+                    if iface == iface_name {
+                        let stats_str = line[colon_pos + 1..].trim();
+                        let stats: Vec<&str> = stats_str.split_whitespace().collect();
+
+                        if stats.len() >= 16 {
+                            // RX statistics
+                            let rx_bytes = stats[0].parse::<u64>().unwrap_or(0);
+                            let rx_packets = stats[1].parse::<u64>().unwrap_or(0);
+                            let rx_errs = stats[2].parse::<u64>().unwrap_or(0);
+                            let rx_drop = stats[3].parse::<u64>().unwrap_or(0);
+                            let rx_fifo = stats[4].parse::<u64>().unwrap_or(0);
+                            let rx_frame = stats[5].parse::<u64>().unwrap_or(0);
+                            let rx_compressed = stats[6].parse::<u64>().unwrap_or(0);
+                            let rx_multicast = stats[7].parse::<u64>().unwrap_or(0);
+
+                            // TX statistics
+                            let tx_bytes = stats[8].parse::<u64>().unwrap_or(0);
+                            let tx_packets = stats[9].parse::<u64>().unwrap_or(0);
+                            let tx_errs = stats[10].parse::<u64>().unwrap_or(0);
+                            let tx_drop = stats[11].parse::<u64>().unwrap_or(0);
+                            let tx_fifo = stats[12].parse::<u64>().unwrap_or(0);
+                            let tx_colls = stats[13].parse::<u64>().unwrap_or(0);
+                            let tx_carrier = stats[14].parse::<u64>().unwrap_or(0);
+                            let tx_compressed = stats[15].parse::<u64>().unwrap_or(0);
+
+                            // Print RX statistics
+                            println!("  RX packets:{} bytes:{} errors:{} dropped:{} fifo:{} frame:{} compressed:{} multicast:{}",
+                                rx_packets, rx_bytes, rx_errs, rx_drop, rx_fifo, rx_frame, rx_compressed, rx_multicast);
+
+                            // Print TX statistics
+                            println!("  TX packets:{} bytes:{} errors:{} dropped:{} fifo:{} collisions:{} carrier:{} compressed:{}",
+                                tx_packets, tx_bytes, tx_errs, tx_drop, tx_fifo, tx_colls, tx_carrier, tx_compressed);
+                        }
+                        break;
                     }
                 }
             }
