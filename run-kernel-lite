@@ -1,0 +1,29 @@
+#/bin/sh
+set -eux
+
+(cd myinit && cargo build --release)
+rm -rf initrd && mkdir initrd
+cp /lib/modules/6.8.0-85-generic/kernel/fs/netfs/netfs.ko initrd/
+cp /lib/modules/6.8.0-85-generic/kernel/net/9p/{9pnet,9pnet_virtio}.ko initrd/
+cp /lib/modules/6.8.0-85-generic/kernel/fs/9p/9p.ko initrd/
+cp /lib/modules/6.8.0-85-generic/kernel/net/ipv6/netfilter/nf_defrag_ipv6.ko initrd/
+cp $NAT46_KO_PATH initrd/
+cp myinit/target/x86_64-unknown-linux-musl/release/myinit initrd/init
+( cd initrd/ && find . | cpio -o -H newc ) | gzip > initrd.gz
+
+
+kvm -kernel $NAT46_NESTED_KERNEL \
+  -initrd initrd.gz \
+  -net nic,model=virtio,macaddr=52:54:00:12:34:56 \
+  -net user,hostfwd=tcp:127.0.0.1:4444-:22 \
+  -append 'console=hvc0' \
+  -chardev stdio,id=stdio,mux=on,signal=off \
+  -device virtio-serial-pci \
+  -device virtconsole,chardev=stdio \
+  -mon chardev=stdio \
+  -display none \
+  -fsdev local,id=fs1,path=/home/ayourtch/fun/nat46/,security_model=none \
+  -s \
+  -device virtio-9p-pci,fsdev=fs1,mount_tag=host-code
+
+
