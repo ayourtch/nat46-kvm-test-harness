@@ -3,6 +3,9 @@ use std::os::unix::io::AsRawFd;
 use std::ffi::CString;
 use std::path::Path;
 
+// MODULE_INIT_COMPRESSED_FILE flag for finit_module
+const MODULE_INIT_COMPRESSED_FILE: i32 = 4;
+
 pub fn main(args: &str) {
     let args = args.trim();
 
@@ -11,14 +14,20 @@ pub fn main(args: &str) {
         return;
     }
 
-    let module_path = args;
+    let requested_path = args;
 
-    if !Path::new(module_path).exists() {
-        eprintln!("Error: Module file '{}' not found", module_path);
+    // Determine which file to use (.ko or .ko.zst)
+    let (actual_path, is_compressed) = find_module_file(requested_path);
+
+    if actual_path.is_none() {
+        eprintln!("Error: Module file '{}' not found", requested_path);
+        eprintln!("  (also checked for .ko.zst variant)");
         return;
     }
 
-    match insmod_internal(module_path) {
+    let module_path = actual_path.unwrap();
+
+    match insmod_internal(&module_path, is_compressed) {
         Ok(_) => {
             println!("Successfully loaded module: {}", module_path);
         }
@@ -36,7 +45,38 @@ pub fn main(args: &str) {
     }
 }
 
-fn insmod_internal(module_path: &str) -> Result<(), String> {
+fn find_module_file(requested_path: &str) -> (Option<String>, bool) {
+    // Check if exact path exists
+    if Path::new(requested_path).exists() {
+        let is_compressed = requested_path.ends_with(".ko.zst");
+        return (Some(requested_path.to_string()), is_compressed);
+    }
+
+    // If requested path ends with .ko, also try .ko.zst
+    if requested_path.ends_with(".ko") {
+        let zst_path = format!("{}.zst", requested_path);
+        if Path::new(&zst_path).exists() {
+            return (Some(zst_path), true);
+        }
+    }
+
+    // If requested path doesn't have .ko extension, try both .ko and .ko.zst
+    if !requested_path.ends_with(".ko") && !requested_path.ends_with(".ko.zst") {
+        let ko_path = format!("{}.ko", requested_path);
+        if Path::new(&ko_path).exists() {
+            return (Some(ko_path), false);
+        }
+
+        let zst_path = format!("{}.ko.zst", requested_path);
+        if Path::new(&zst_path).exists() {
+            return (Some(zst_path), true);
+        }
+    }
+
+    (None, false)
+}
+
+fn insmod_internal(module_path: &str, is_compressed: bool) -> Result<(), String> {
     // Open the kernel module file
     let file = File::open(module_path)
         .map_err(|e| format!("Failed to open {}: {}", module_path, e))?;
@@ -44,9 +84,16 @@ fn insmod_internal(module_path: &str) -> Result<(), String> {
     let fd = file.as_raw_fd();
     let params = CString::new("").unwrap();
 
+    // Set flags based on whether the module is compressed
+    let flags = if is_compressed {
+        MODULE_INIT_COMPRESSED_FILE
+    } else {
+        0
+    };
+
     // Use finit_module syscall (syscall number 313 on x86_64)
     let result = unsafe {
-        libc::syscall(libc::SYS_finit_module, fd, params.as_ptr(), 0)
+        libc::syscall(libc::SYS_finit_module, fd, params.as_ptr(), flags)
     };
 
     if result == 0 {
@@ -92,5 +139,5 @@ fn read_recent_kmsg(lines: usize) -> Result<Vec<String>, String> {
 }
 
 pub fn help_text() -> &'static str {
-    "insmod <module>                   - Load kernel module"
+    "insmod <module>                   - Load kernel module (.ko or .ko.zst)"
 }
