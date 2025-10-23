@@ -4,15 +4,22 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Global state for managing captures
 lazy_static::lazy_static! {
     static ref CAPTURES: Arc<Mutex<HashMap<String, CaptureHandle>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
+#[derive(Clone, Copy)]
+enum CaptureFormat {
+    Jsonl,
+    Pcap,
+}
+
 struct CaptureHandle {
     output_file: String,
+    format: CaptureFormat,
     stop_flag: Arc<AtomicBool>,
     thread_handle: Option<JoinHandle<()>>,
     packets_captured: Arc<Mutex<u64>>,
@@ -24,27 +31,51 @@ pub fn main(args: &str) {
 
     if parts.is_empty() {
         eprintln!("Usage:");
-        eprintln!("  capture start <iface> <file> [count]  - Start capturing packets");
-        eprintln!("  capture stop <iface>                   - Stop capture on interface");
-        eprintln!("  capture stop all                       - Stop all captures");
-        eprintln!("  capture show                           - Show active captures");
+        eprintln!("  capture start <iface> <file> [jsonl|pcap] [count]  - Start capturing packets");
+        eprintln!("  capture stop <iface>                                - Stop capture on interface");
+        eprintln!("  capture stop all                                    - Stop all captures");
+        eprintln!("  capture show                                        - Show active captures");
         return;
     }
 
     match parts[0] {
         "start" => {
             if parts.len() < 3 {
-                eprintln!("Usage: capture start <iface> <file> [count]");
+                eprintln!("Usage: capture start <iface> <file> [jsonl|pcap] [count]");
+                eprintln!("  Format defaults to jsonl if not specified");
+                eprintln!("  Count is optional packet limit");
                 return;
             }
             let iface = parts[1];
             let file = parts[2];
-            let count = if parts.len() > 3 {
-                parts[3].parse::<u64>().ok()
-            } else {
-                None
-            };
-            start_capture(iface, file, count);
+
+            // Parse optional format and count
+            let mut format = CaptureFormat::Jsonl;
+            let mut count = None;
+
+            if parts.len() > 3 {
+                // Check if part[3] is a format or count
+                match parts[3] {
+                    "jsonl" => {
+                        format = CaptureFormat::Jsonl;
+                        if parts.len() > 4 {
+                            count = parts[4].parse::<u64>().ok();
+                        }
+                    }
+                    "pcap" => {
+                        format = CaptureFormat::Pcap;
+                        if parts.len() > 4 {
+                            count = parts[4].parse::<u64>().ok();
+                        }
+                    }
+                    _ => {
+                        // Try to parse as count
+                        count = parts[3].parse::<u64>().ok();
+                    }
+                }
+            }
+
+            start_capture(iface, file, format, count);
         }
         "stop" => {
             if parts.len() < 2 {
@@ -67,7 +98,7 @@ pub fn main(args: &str) {
     }
 }
 
-fn start_capture(iface: &str, output_file: &str, max_packets: Option<u64>) {
+fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_packets: Option<u64>) {
     let mut captures = CAPTURES.lock().unwrap();
 
     // Check if already capturing on this interface
@@ -92,6 +123,7 @@ fn start_capture(iface: &str, output_file: &str, max_packets: Option<u64>) {
         capture_thread(
             &iface_clone,
             &output_clone,
+            format,
             stop_flag_clone,
             packets_captured_clone,
             max_packets,
@@ -103,6 +135,7 @@ fn start_capture(iface: &str, output_file: &str, max_packets: Option<u64>) {
         iface_owned.clone(),
         CaptureHandle {
             output_file: output_file_owned,
+            format,
             stop_flag,
             thread_handle: Some(thread_handle),
             packets_captured,
@@ -110,10 +143,16 @@ fn start_capture(iface: &str, output_file: &str, max_packets: Option<u64>) {
         },
     );
 
+    let format_str = match format {
+        CaptureFormat::Jsonl => "jsonl",
+        CaptureFormat::Pcap => "pcap",
+    };
+
     println!(
-        "Started capture on {} -> {} {}",
+        "Started capture on {} -> {} (format: {}) {}",
         iface,
         output_file,
+        format_str,
         if let Some(count) = max_packets {
             format!("(max {} packets)", count)
         } else {
@@ -168,8 +207,8 @@ fn show_captures() {
     }
 
     println!("\nActive captures:");
-    println!("{:<15} {:<30} {:<12} {}", "Interface", "Output File", "Packets", "Limit");
-    println!("{}", "-".repeat(70));
+    println!("{:<15} {:<30} {:<8} {:<12} {}", "Interface", "Output File", "Format", "Packets", "Limit");
+    println!("{}", "-".repeat(80));
 
     for (iface, handle) in captures.iter() {
         let count = *handle.packets_captured.lock().unwrap();
@@ -178,9 +217,13 @@ fn show_captures() {
         } else {
             "unlimited".to_string()
         };
+        let format_str = match handle.format {
+            CaptureFormat::Jsonl => "jsonl",
+            CaptureFormat::Pcap => "pcap",
+        };
         println!(
-            "{:<15} {:<30} {:<12} {}",
-            iface, handle.output_file, count, limit_str
+            "{:<15} {:<30} {:<8} {:<12} {}",
+            iface, handle.output_file, format_str, count, limit_str
         );
     }
 }
@@ -188,6 +231,7 @@ fn show_captures() {
 fn capture_thread(
     iface: &str,
     output_file: &str,
+    format: CaptureFormat,
     stop_flag: Arc<AtomicBool>,
     packets_captured: Arc<Mutex<u64>>,
     max_packets: Option<u64>,
@@ -200,6 +244,14 @@ fn capture_thread(
             return;
         }
     };
+
+    // Write pcap header if needed
+    if matches!(format, CaptureFormat::Pcap) {
+        if let Err(e) = write_pcap_header(&mut file) {
+            eprintln!("Failed to write pcap header: {}", e);
+            return;
+        }
+    }
 
     // Create raw packet socket (AF_PACKET)
     let sock = unsafe {
@@ -303,14 +355,20 @@ fn capture_thread(
         // Get timestamp
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros();
+            .unwrap();
 
-        // Convert packet to JSON line
-        let json_line = packet_to_jsonl(&buffer[..packet_len], timestamp, count);
+        // Write packet in appropriate format
+        let write_result = match format {
+            CaptureFormat::Jsonl => {
+                let json_line = packet_to_jsonl(&buffer[..packet_len], timestamp.as_micros(), count);
+                writeln!(file, "{}", json_line)
+            }
+            CaptureFormat::Pcap => {
+                write_pcap_packet(&mut file, &buffer[..packet_len], timestamp)
+            }
+        };
 
-        // Write to file and flush
-        if let Err(e) = writeln!(file, "{}", json_line) {
+        if let Err(e) = write_result {
             eprintln!("Failed to write packet to file: {}", e);
             break;
         }
@@ -365,6 +423,48 @@ fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, seq: u64) -> String {
     )
 }
 
+// PCAP file format functions
+fn write_pcap_header(file: &mut File) -> std::io::Result<()> {
+    // PCAP Global Header (24 bytes)
+    // https://wiki.wireshark.org/Development/LibpcapFileFormat
+
+    let magic_number: u32 = 0xa1b2c3d4;  // Microsecond resolution
+    let version_major: u16 = 2;
+    let version_minor: u16 = 4;
+    let thiszone: i32 = 0;               // GMT to local correction
+    let sigfigs: u32 = 0;                // Accuracy of timestamps
+    let snaplen: u32 = 65535;            // Max length of captured packets
+    let network: u32 = 1;                // Data link type (1 = Ethernet)
+
+    file.write_all(&magic_number.to_le_bytes())?;
+    file.write_all(&version_major.to_le_bytes())?;
+    file.write_all(&version_minor.to_le_bytes())?;
+    file.write_all(&thiszone.to_le_bytes())?;
+    file.write_all(&sigfigs.to_le_bytes())?;
+    file.write_all(&snaplen.to_le_bytes())?;
+    file.write_all(&network.to_le_bytes())?;
+
+    Ok(())
+}
+
+fn write_pcap_packet(file: &mut File, packet: &[u8], timestamp: Duration) -> std::io::Result<()> {
+    // PCAP Packet Header (16 bytes)
+    let ts_sec = timestamp.as_secs() as u32;
+    let ts_usec = timestamp.subsec_micros() as u32;
+    let incl_len = packet.len() as u32;  // Number of octets saved
+    let orig_len = packet.len() as u32;  // Actual length of packet
+
+    file.write_all(&ts_sec.to_le_bytes())?;
+    file.write_all(&ts_usec.to_le_bytes())?;
+    file.write_all(&incl_len.to_le_bytes())?;
+    file.write_all(&orig_len.to_le_bytes())?;
+
+    // Write packet data
+    file.write_all(packet)?;
+
+    Ok(())
+}
+
 pub fn help_text() -> &'static str {
-    "capture <start|stop|show>          - Capture packets to JSONL file"
+    "capture <start|stop|show>          - Capture packets to JSONL/PCAP file"
 }
