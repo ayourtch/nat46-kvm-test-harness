@@ -258,11 +258,11 @@ mount 9p
     if !skip_autoexec {
         // Try to run autoexec.run
         use std::path::Path;
-        if Path::new("/autoexec.run").exists() {
-            println!("\nExecuting /autoexec.run...");
-            execute_command("run", "/autoexec.run");
+        if Path::new("/mnt/host/test-harness/autoexec.run").exists() {
+            println!("\nExecuting /mnt/host/test-harness/autoexec.run...");
+            execute_command("run", "/mnt/host/test-harness/autoexec.run");
         } else {
-            println!("\nNo /autoexec.run found, skipping.");
+            println!("\nNo /mnt/host/test-harness/autoexec.run found, skipping.");
         }
 
         // Second countdown: Shutdown or interactive mode (only if didn't skip autoexec)
