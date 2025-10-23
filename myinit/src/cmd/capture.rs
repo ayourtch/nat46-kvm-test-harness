@@ -325,13 +325,18 @@ fn capture_thread(
             }
         }
 
-        // Try to receive packet
+        // Try to receive packet with source address (to get packet type)
+        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        let mut sll_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+
         let result = unsafe {
-            libc::recv(
+            libc::recvfrom(
                 sock,
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 buffer.len(),
                 0,
+                &mut sll as *mut libc::sockaddr_ll as *mut libc::sockaddr,
+                &mut sll_len,
             )
         };
 
@@ -349,6 +354,12 @@ fn capture_thread(
 
         let packet_len = result as usize;
         if packet_len == 0 {
+            continue;
+        }
+
+        // Skip outgoing packets to avoid duplicates
+        // PACKET_OUTGOING = 4
+        if sll.sll_pkttype == 4 {
             continue;
         }
 
