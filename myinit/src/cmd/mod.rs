@@ -45,6 +45,7 @@ define_commands! {
     help,
     ifconfig,
     insmod,
+    ip,
     ls,
     mknod,
     mount,
