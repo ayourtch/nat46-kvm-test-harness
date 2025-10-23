@@ -17,6 +17,7 @@ jobs:
       - name: Build the project
         run: |
           cd myinit
+          rustup target add x86_64-unknown-linux-musl
           cargo build --release
       - name: Create Release
         id: create_release
