@@ -134,6 +134,21 @@ fn print_interface_info(iface_name: &str) {
         }
     };
 
+    // Get hardware address (MAC address)
+    unsafe {
+        let mut ifr_hwaddr: libc::ifreq = mem::zeroed();
+        for i in 0..copy_len {
+            ifr_hwaddr.ifr_name[i] = iface_bytes[i] as i8;
+        }
+        if libc::ioctl(sock, libc::SIOCGIFHWADDR as i32, &mut ifr_hwaddr) == 0 {
+            let hwaddr = &ifr_hwaddr.ifr_ifru.ifru_hwaddr;
+            let mac_bytes = &hwaddr.sa_data[0..6];
+            println!("  HWaddr: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac_bytes[0] as u8, mac_bytes[1] as u8, mac_bytes[2] as u8,
+                mac_bytes[3] as u8, mac_bytes[4] as u8, mac_bytes[5] as u8);
+        }
+    }
+
     // Print flags
     print!("  Flags: ");
     if flags & libc::IFF_UP as i16 != 0 { print!("UP "); }
