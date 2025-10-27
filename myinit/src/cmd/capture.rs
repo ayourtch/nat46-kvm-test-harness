@@ -420,18 +420,41 @@ fn get_interface_index(iface_name: &str) -> Option<i32> {
     }
 }
 
-fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, seq: u64) -> String {
-    // Create JSON object with packet data
-    // Format: {"seq": N, "timestamp_us": T, "length": L, "data": "hex..."}
+fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64) -> String {
+    use oside::protocols::all::*;
+    use oside::*;
 
-    let hex_data: String = packet.iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
+    // Parse packet using oside
+    let layers = match Ether!().ldecode(packet) {
+        Some((stack, _)) => stack.layers,
+        None => {
+            // If parsing fails, fallback to hex encoding
+            let hex_data: String = packet.iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            return format!(
+                r#"{{"timestamp_us":{},"data":"{}"}}"#,
+                timestamp_us, hex_data
+            );
+        }
+    };
 
-    format!(
-        r#"{{"seq":{},"timestamp_us":{},"length":{},"data":"{}"}}"#,
-        seq, timestamp_us, packet.len(), hex_data
-    )
+    // Create JSON with timestamp and layers
+    let layers_json = match serde_json::to_string(&layers) {
+        Ok(j) => j,
+        Err(_) => {
+            // Fallback to hex if serialization fails
+            let hex_data: String = packet.iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            return format!(
+                r#"{{"timestamp_us":{},"data":"{}"}}"#,
+                timestamp_us, hex_data
+            );
+        }
+    };
+
+    format!(r#"{{"timestamp_us":{},"layers":{}}}"#, timestamp_us, layers_json)
 }
 
 // PCAP file format functions

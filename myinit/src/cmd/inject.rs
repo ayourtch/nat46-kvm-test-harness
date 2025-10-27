@@ -236,51 +236,42 @@ fn parse_jsonl_file(filename: &str) -> Result<Vec<Packet>, String> {
 }
 
 fn parse_jsonl_line(line: &str) -> Result<Packet, String> {
-    // Parse JSON manually (simple parsing for our known format)
-    // Format: {"seq":N,"timestamp_us":T,"length":L,"data":"hexstring"}
+    use oside::*;
 
-    let timestamp_us = extract_json_number(line, "timestamp_us")?;
-    let hex_data = extract_json_string(line, "data")?;
+    // Parse JSON using serde_json
+    let json: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-    // Convert hex string to bytes
-    let data = hex_to_bytes(&hex_data)?;
+    // Extract timestamp
+    let timestamp_us = json.get("timestamp_us")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "Missing or invalid timestamp_us".to_string())? as u128;
+
+    // Check if we have "layers" (new format) or "data" (old format)
+    let data = if let Some(layers_val) = json.get("layers") {
+        // New format: parse layers and encode to bytes
+        let layers: Vec<Box<dyn Layer>> = serde_json::from_value(layers_val.clone())
+            .map_err(|e| format!("Failed to parse layers: {}", e))?;
+
+        let stack = LayerStack {
+            filled: true,
+            layers,
+        };
+
+        stack.lencode()
+    } else if let Some(data_val) = json.get("data") {
+        // Old format: hex string
+        let hex_data = data_val.as_str()
+            .ok_or_else(|| "Invalid data field".to_string())?;
+        hex_to_bytes(hex_data)?
+    } else {
+        return Err("JSON must have either 'layers' or 'data' field".to_string());
+    };
 
     Ok(Packet {
         timestamp_us,
         data,
     })
-}
-
-fn extract_json_number(json: &str, key: &str) -> Result<u128, String> {
-    let pattern = format!("\"{}\":", key);
-    let start = json.find(&pattern)
-        .ok_or_else(|| format!("Key '{}' not found", key))?;
-
-    let value_start = start + pattern.len();
-    let rest = &json[value_start..];
-
-    // Find the end of the number (comma or closing brace)
-    let value_end = rest.find(|c| c == ',' || c == '}')
-        .ok_or_else(|| format!("Invalid JSON format for key '{}'", key))?;
-
-    let value_str = rest[..value_end].trim();
-    value_str.parse::<u128>()
-        .map_err(|e| format!("Failed to parse number: {}", e))
-}
-
-fn extract_json_string(json: &str, key: &str) -> Result<String, String> {
-    let pattern = format!("\"{}\":\"", key);
-    let start = json.find(&pattern)
-        .ok_or_else(|| format!("Key '{}' not found", key))?;
-
-    let value_start = start + pattern.len();
-    let rest = &json[value_start..];
-
-    // Find closing quote
-    let value_end = rest.find('"')
-        .ok_or_else(|| format!("Invalid JSON string for key '{}'", key))?;
-
-    Ok(rest[..value_end].to_string())
 }
 
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
