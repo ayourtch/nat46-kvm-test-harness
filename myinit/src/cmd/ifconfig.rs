@@ -35,6 +35,16 @@ pub fn main(args: &str) {
                     eprintln!("{}", e);
                 }
             }
+            "promisc" => {
+                if let Err(e) = set_promiscuous_mode(iface, true) {
+                    eprintln!("{}", e);
+                }
+            }
+            "-promisc" => {
+                if let Err(e) = set_promiscuous_mode(iface, false) {
+                    eprintln!("{}", e);
+                }
+            }
             _ => {
                 // Check if it looks like an IP address (contains dots)
                 if parts[i].contains('.') {
@@ -155,6 +165,7 @@ fn print_interface_info(iface_name: &str) {
     if flags & libc::IFF_BROADCAST as i16 != 0 { print!("BROADCAST "); }
     if flags & libc::IFF_LOOPBACK as i16 != 0 { print!("LOOPBACK "); }
     if flags & libc::IFF_RUNNING as i16 != 0 { print!("RUNNING "); }
+    if flags & libc::IFF_PROMISC as i16 != 0 { print!("PROMISC "); }
     if flags & libc::IFF_MULTICAST as i16 != 0 { print!("MULTICAST "); }
     println!();
 
@@ -572,6 +583,51 @@ pub fn bring_interface_down(iface_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn set_promiscuous_mode(iface_name: &str, enable: bool) -> Result<(), String> {
+    let action = if enable { "Enabling" } else { "Disabling" };
+    println!("{} promiscuous mode on {}...", action, iface_name);
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err("Failed to create socket".to_string());
+    }
+
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    let iface_bytes = iface_name.as_bytes();
+    let copy_len = iface_bytes.len().min(libc::IFNAMSIZ - 1);
+    for i in 0..copy_len {
+        ifr.ifr_name[i] = iface_bytes[i] as i8;
+    }
+
+    unsafe {
+        // Get current flags
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as i32, &mut ifr) < 0 {
+            let errno = *libc::__errno_location();
+            libc::close(sock);
+            return Err(format!("Failed to get interface flags: errno {}", errno));
+        }
+
+        // Set or clear PROMISC flag
+        if enable {
+            ifr.ifr_ifru.ifru_flags |= libc::IFF_PROMISC as i16;
+        } else {
+            ifr.ifr_ifru.ifru_flags &= !(libc::IFF_PROMISC as i16);
+        }
+
+        if libc::ioctl(sock, libc::SIOCSIFFLAGS as i32, &mut ifr) < 0 {
+            let errno = *libc::__errno_location();
+            libc::close(sock);
+            return Err(format!("Failed to set promiscuous mode: errno {}", errno));
+        }
+
+        libc::close(sock);
+    }
+
+    println!("Successfully {} promiscuous mode on {}",
+        if enable { "enabled" } else { "disabled" }, iface_name);
+    Ok(())
+}
+
 pub fn help_text() -> &'static str {
-    "ifconfig [iface] [config]         - Configure network interfaces"
+    "ifconfig [iface] [config]         - Configure network interfaces (up/down/promisc/-promisc)"
 }

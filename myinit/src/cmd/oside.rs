@@ -485,11 +485,21 @@ impl Editor {
             layers: packet.layers.clone(),
         };
 
-        // Fill auto fields (checksums, lengths, etc.)
-        let filled_stack = stack.fill();
+        // Encode the packet - this actually calculates checksums, lengths, etc.
+        let encoded = stack.lencode();
 
-        // Update packet with filled layers
-        packet.layers = filled_stack.layers;
+        // Decode it back to get the filled layers
+        // Start with the first layer's decoder
+        if packet.layers.is_empty() {
+            return Err("No layers to recalculate".to_string());
+        }
+
+        // Use Ether as the starting decoder (most common case)
+        let decoded = Ether!().ldecode(&encoded)
+            .ok_or("Failed to decode packet".to_string())?;
+
+        // Update packet with recalculated layers
+        packet.layers = decoded.0.layers;
         self.modified = true;
         self.message = "Auto fields recalculated (checksums, lengths, etc.)".to_string();
 
