@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, Write, Read};
 use oside::*;
+use oside::protocols::all::*;
 
 pub fn main(args: &str) {
     let filename = args.trim();
@@ -24,7 +25,7 @@ struct PacketEntry {
 struct Editor {
     packets: Vec<PacketEntry>,
     current_packet: usize,
-    current_layer: usize,
+    current_layer: isize,  // -1 = timestamp, 0+ = layer index
     current_field: usize,
     filename: String,
     modified: bool,
@@ -84,7 +85,7 @@ impl Editor {
         Ok(Editor {
             packets,
             current_packet: 0,
-            current_layer: 0,
+            current_layer: -1,  // Start at timestamp
             current_field: 0,
             filename: filename.to_string(),
             modified: false,
@@ -137,17 +138,13 @@ impl Editor {
                     json.get("dst").and_then(|v| v.as_str()).unwrap_or("?"))
             }
             "Tcp" => {
-                format!("TCP {}:{} -> {}:{}",
+                format!("TCP {} -> {}",
                     json.get("sport").and_then(|v| v.as_u64()).unwrap_or(0),
-                    json.get("sport").and_then(|v| v.as_u64()).unwrap_or(0),
-                    json.get("dport").and_then(|v| v.as_u64()).unwrap_or(0),
                     json.get("dport").and_then(|v| v.as_u64()).unwrap_or(0))
             }
             "Udp" => {
-                format!("UDP {}:{} -> {}:{}",
+                format!("UDP {} -> {}",
                     json.get("sport").and_then(|v| v.as_u64()).unwrap_or(0),
-                    json.get("sport").and_then(|v| v.as_u64()).unwrap_or(0),
-                    json.get("dport").and_then(|v| v.as_u64()).unwrap_or(0),
                     json.get("dport").and_then(|v| v.as_u64()).unwrap_or(0))
             }
             _ => type_name.to_string(),
@@ -203,9 +200,25 @@ impl Editor {
         }
 
         let mut current_line = 2;
+        let mut edit_cursor_row = 0;
+        let mut edit_cursor_col = 0;
 
-        // Timestamp
-        print!("\x1b[{};1HTimestamp: {} us", current_line, packet.timestamp_us);
+        // Timestamp (editable) - layer -1
+        let ts_marker = if self.current_layer == -1 && self.mode == EditorMode::Navigation {
+            ">"
+        } else if self.current_layer == -1 && self.mode == EditorMode::Editing {
+            "*"
+        } else {
+            " "
+        };
+
+        if self.current_layer == -1 && self.mode == EditorMode::Editing {
+            print!("\x1b[{};1H{} timestamp_us: [{}]", current_line, ts_marker, self.edit_buffer);
+            edit_cursor_row = current_line;
+            edit_cursor_col = 1 + 1 + "timestamp_us".len() + 3 + self.edit_cursor + 1;
+        } else {
+            print!("\x1b[{};1H{} timestamp_us: {}", current_line, ts_marker, packet.timestamp_us);
+        }
         current_line += 2;
 
         // Layers
@@ -216,7 +229,7 @@ impl Editor {
             if current_line >= 23 {
                 break;
             }
-            let marker = if idx == self.current_layer { ">" } else { " " };
+            let marker = if self.current_layer >= 0 && idx == (self.current_layer as usize) { ">" } else { " " };
             let summary = self.get_layer_summary(layer);
             print!("\x1b[{};1H{} [{}] {}", current_line, marker, idx, summary);
             current_line += 1;
@@ -225,14 +238,11 @@ impl Editor {
         current_line += 1;
 
         // Current layer fields
-        let mut edit_cursor_row = 0;
-        let mut edit_cursor_col = 0;
-
-        if self.current_layer < packet.layers.len() && current_line < 23 {
+        if self.current_layer >= 0 && (self.current_layer as usize) < packet.layers.len() && current_line < 23 {
             print!("\x1b[{};1H=== Layer {} Fields ===", current_line, self.current_layer);
             current_line += 1;
 
-            let fields = self.get_layer_fields(&packet.layers[self.current_layer]);
+            let fields = self.get_layer_fields(&packet.layers[self.current_layer as usize]);
 
             for (idx, (key, value)) in fields.iter().enumerate() {
                 if current_line >= 23 {
@@ -268,7 +278,7 @@ impl Editor {
         // Help bar at line 25
         print!("\x1b[25;1H\x1b[7m");
         let help = if self.mode == EditorMode::Navigation {
-            " Arrows:Nav | n/p:Packet | e:Edit | d:Delete | c:Copy | s:Save | q:Quit "
+            " n/p:Pkt | e:Edit | a:Add | r:Rem | f:CalcAuto | d:Del | c:Copy | s:Save | q:Quit "
         } else {
             " Arrows:Move | Del/Bksp | ^A/E:Home/End | ^K/U:Kill | Enter:Save | Esc:Cancel "
         };
@@ -284,11 +294,20 @@ impl Editor {
     }
 
     fn start_editing(&mut self) {
-        if self.current_layer >= self.packets[self.current_packet].layers.len() {
+        // Check if we're on the timestamp field (layer -1)
+        if self.current_layer == -1 {
+            self.edit_buffer = self.packets[self.current_packet].timestamp_us.to_string();
+            self.edit_cursor = self.edit_buffer.len();
+            self.mode = EditorMode::Editing;
             return;
         }
 
-        let fields = self.get_layer_fields(&self.packets[self.current_packet].layers[self.current_layer]);
+        if self.current_layer < 0 || (self.current_layer as usize) >= self.packets[self.current_packet].layers.len() {
+            return;
+        }
+
+        let fields = self.get_layer_fields(&self.packets[self.current_packet].layers[self.current_layer as usize]);
+
         if self.current_field >= fields.len() {
             return;
         }
@@ -299,11 +318,23 @@ impl Editor {
     }
 
     fn save_edit(&mut self) -> Result<(), String> {
-        if self.current_layer >= self.packets[self.current_packet].layers.len() {
+        // Handle timestamp editing (layer -1)
+        if self.current_layer == -1 {
+            let new_timestamp = self.edit_buffer.parse::<u128>()
+                .map_err(|_| "Invalid timestamp value".to_string())?;
+            self.packets[self.current_packet].timestamp_us = new_timestamp;
+            self.modified = true;
+            self.mode = EditorMode::Navigation;
+            self.message = "Timestamp updated".to_string();
+            return Ok(());
+        }
+
+        if self.current_layer < 0 || (self.current_layer as usize) >= self.packets[self.current_packet].layers.len() {
             return Err("Invalid layer".to_string());
         }
 
-        let fields = self.get_layer_fields(&self.packets[self.current_packet].layers[self.current_layer]);
+        let fields = self.get_layer_fields(&self.packets[self.current_packet].layers[self.current_layer as usize]);
+
         if self.current_field >= fields.len() {
             return Err("Invalid field".to_string());
         }
@@ -312,7 +343,7 @@ impl Editor {
         let new_value = &self.edit_buffer;
 
         // Get the layer as JSON
-        let mut json = serde_json::to_value(&self.packets[self.current_packet].layers[self.current_layer])
+        let mut json = serde_json::to_value(&self.packets[self.current_packet].layers[self.current_layer as usize])
             .map_err(|e| format!("Serialization error: {}", e))?;
 
         // Update the field
@@ -360,7 +391,7 @@ impl Editor {
         let new_layer: Box<dyn Layer> = serde_json::from_value(json)
             .map_err(|e| format!("Deserialization error: {}", e))?;
 
-        self.packets[self.current_packet].layers[self.current_layer] = new_layer;
+        self.packets[self.current_packet].layers[self.current_layer as usize] = new_layer;
         self.modified = true;
         self.mode = EditorMode::Navigation;
         self.message = "Field updated".to_string();
@@ -387,6 +418,117 @@ impl Editor {
         self.current_packet += 1;
         self.modified = true;
         self.message = "Packet copied".to_string();
+    }
+
+    fn remove_layer(&mut self) {
+        if self.current_layer < 0 {
+            self.message = "Cannot remove timestamp".to_string();
+            return;
+        }
+
+        let packet = &mut self.packets[self.current_packet];
+
+        if packet.layers.len() <= 1 {
+            self.message = "Cannot remove last layer".to_string();
+            return;
+        }
+
+        if (self.current_layer as usize) < packet.layers.len() {
+            packet.layers.remove(self.current_layer as usize);
+            if (self.current_layer as usize) >= packet.layers.len() && self.current_layer > 0 {
+                self.current_layer -= 1;
+            }
+            self.current_field = 0;
+            self.modified = true;
+            self.message = "Layer removed".to_string();
+        }
+    }
+
+    fn add_layer(&mut self, layer_type: &str) -> Result<(), String> {
+        let new_layer: Box<dyn Layer> = match layer_type {
+            "ether" => Box::new(Ether!()),
+            "ip" => Box::new(IP!()),
+            "ipv6" => Box::new(IPV6!()),
+            "tcp" => Box::new(TCP!()),
+            "udp" => Box::new(UDP!()),
+            "icmp" => Box::new(ICMP!()),
+            "arp" => Box::new(ARP!()),
+            "raw" => Box::new(Raw!("".into())),
+            _ => return Err(format!("Unknown layer type: {}", layer_type)),
+        };
+
+        let packet = &mut self.packets[self.current_packet];
+
+        // If at timestamp (-1), insert at position 0
+        // If at a layer, insert after current layer
+        let insert_pos = if self.current_layer < 0 {
+            0
+        } else {
+            (self.current_layer as usize) + 1
+        };
+
+        packet.layers.insert(insert_pos, new_layer);
+        self.current_layer = insert_pos as isize;
+        self.current_field = 0;
+        self.modified = true;
+        self.message = format!("Added {} layer", layer_type);
+
+        Ok(())
+    }
+
+    fn recalculate_auto_fields(&mut self) -> Result<(), String> {
+        let packet = &mut self.packets[self.current_packet];
+
+        // Create a LayerStack with filled=false to trigger auto field calculation
+        let stack = LayerStack {
+            filled: false,
+            layers: packet.layers.clone(),
+        };
+
+        // Fill auto fields (checksums, lengths, etc.)
+        let filled_stack = stack.fill();
+
+        // Update packet with filled layers
+        packet.layers = filled_stack.layers;
+        self.modified = true;
+        self.message = "Auto fields recalculated (checksums, lengths, etc.)".to_string();
+
+        Ok(())
+    }
+}
+
+fn show_layer_menu(stdin: &mut io::Stdin) -> Option<String> {
+    // Show layer selection menu
+    print!("\x1b[10;20H\x1b[7m                                        \x1b[0m");
+    print!("\x1b[11;20H\x1b[7m  Select Layer Type:                   \x1b[0m");
+    print!("\x1b[12;20H\x1b[7m                                        \x1b[0m");
+    print!("\x1b[13;20H  1. Ethernet (ether)                    ");
+    print!("\x1b[14;20H  2. IPv4 (ip)                           ");
+    print!("\x1b[15;20H  3. IPv6 (ipv6)                         ");
+    print!("\x1b[16;20H  4. TCP                                 ");
+    print!("\x1b[17;20H  5. UDP                                 ");
+    print!("\x1b[18;20H  6. ICMP                                ");
+    print!("\x1b[19;20H  7. ARP                                 ");
+    print!("\x1b[20;20H  8. Raw                                 ");
+    print!("\x1b[21;20H\x1b[7m  Esc to cancel                        \x1b[0m");
+    io::stdout().flush().unwrap();
+
+    let mut buf = [0u8; 1];
+    loop {
+        if stdin.read_exact(&mut buf).is_ok() {
+            match buf[0] {
+                b'1' => return Some("ether".to_string()),
+                b'2' => return Some("ip".to_string()),
+                b'3' => return Some("ipv6".to_string()),
+                b'4' => return Some("tcp".to_string()),
+                b'5' => return Some("udp".to_string()),
+                b'6' => return Some("icmp".to_string()),
+                b'7' => return Some("arp".to_string()),
+                b'8' => return Some("raw".to_string()),
+                27 => return None, // Esc
+                _ => continue,
+            }
+        }
     }
 }
 
@@ -463,6 +605,26 @@ fn run_editor(filename: &str) -> io::Result<()> {
                     b'c' => {
                         editor.copy_packet();
                     }
+                    // r - Remove layer
+                    b'r' => {
+                        editor.remove_layer();
+                    }
+                    // a - Add layer
+                    b'a' => {
+                        if let Some(layer_type) = show_layer_menu(&mut stdin) {
+                            if let Err(e) = editor.add_layer(&layer_type) {
+                                editor.message = format!("Error: {}", e);
+                            }
+                        } else {
+                            editor.message = "Cancelled".to_string();
+                        }
+                    }
+                    // f - Fill/recalculate auto fields
+                    b'f' => {
+                        if let Err(e) = editor.recalculate_auto_fields() {
+                            editor.message = format!("Error: {}", e);
+                        }
+                    }
                     // Arrow keys
                     27 => {
                         let mut seq = [0u8; 2];
@@ -470,23 +632,35 @@ fn run_editor(filename: &str) -> io::Result<()> {
                             if stdin.read(&mut seq[1..2]).is_ok() {
                                 match seq[1] {
                                     b'A' => { // Up
-                                        if editor.current_field > 0 {
+                                        if editor.current_layer == -1 {
+                                            // Already at timestamp, can't go up
+                                        } else if editor.current_field > 0 {
                                             editor.current_field -= 1;
                                         } else if editor.current_layer > 0 {
                                             editor.current_layer -= 1;
                                             let fields = editor.get_layer_fields(
-                                                &editor.packets[editor.current_packet].layers[editor.current_layer]
+                                                &editor.packets[editor.current_packet].layers[editor.current_layer as usize]
                                             );
                                             editor.current_field = fields.len().saturating_sub(1);
+                                        } else {
+                                            // current_layer == 0, current_field == 0, go to timestamp
+                                            editor.current_layer = -1;
+                                            editor.current_field = 0;
                                         }
                                     }
                                     b'B' => { // Down
                                         let packet = &editor.packets[editor.current_packet];
-                                        if editor.current_layer < packet.layers.len() {
-                                            let fields = editor.get_layer_fields(&packet.layers[editor.current_layer]);
+                                        if editor.current_layer == -1 {
+                                            // At timestamp, go to layer 0 first field
+                                            if !packet.layers.is_empty() {
+                                                editor.current_layer = 0;
+                                                editor.current_field = 0;
+                                            }
+                                        } else if (editor.current_layer as usize) < packet.layers.len() {
+                                            let fields = editor.get_layer_fields(&packet.layers[editor.current_layer as usize]);
                                             if editor.current_field < fields.len() - 1 {
                                                 editor.current_field += 1;
-                                            } else if editor.current_layer < packet.layers.len() - 1 {
+                                            } else if (editor.current_layer as usize) < packet.layers.len() - 1 {
                                                 editor.current_layer += 1;
                                                 editor.current_field = 0;
                                             }
@@ -494,7 +668,7 @@ fn run_editor(filename: &str) -> io::Result<()> {
                                     }
                                     b'C' => { // Right - next layer
                                         let packet = &editor.packets[editor.current_packet];
-                                        if editor.current_layer < packet.layers.len() - 1 {
+                                        if editor.current_layer >= 0 && (editor.current_layer as usize) < packet.layers.len() - 1 {
                                             editor.current_layer += 1;
                                             editor.current_field = 0;
                                         }
@@ -502,6 +676,9 @@ fn run_editor(filename: &str) -> io::Result<()> {
                                     b'D' => { // Left - prev layer
                                         if editor.current_layer > 0 {
                                             editor.current_layer -= 1;
+                                            editor.current_field = 0;
+                                        } else if editor.current_layer == 0 {
+                                            editor.current_layer = -1;
                                             editor.current_field = 0;
                                         }
                                     }
