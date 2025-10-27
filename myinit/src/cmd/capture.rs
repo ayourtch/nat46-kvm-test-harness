@@ -236,6 +236,14 @@ fn capture_thread(
     packets_captured: Arc<Mutex<u64>>,
     max_packets: Option<u64>,
 ) {
+    // Detect if interface is TAP (layer 2) or TUN (layer 3) by checking BROADCAST flag
+    let is_tap = is_interface_tap(iface);
+    if is_tap {
+        println!("Detected L2-ethernet interface");
+    } else {
+        println!("Detected L3 interface");
+    }
+
     // Create output file
     let mut file = match File::create(output_file) {
         Ok(f) => f,
@@ -357,11 +365,13 @@ fn capture_thread(
             continue;
         }
 
-        // Skip outgoing packets to avoid duplicates
-        // PACKET_OUTGOING = 4
-        if sll.sll_pkttype == 4 {
-            continue;
-        }
+        // Determine packet direction
+        // PACKET_OUTGOING = 4, PACKET_HOST = 0
+        let direction = if sll.sll_pkttype == 4 {
+            "tx"
+        } else {
+            "rx"
+        };
 
         // Get timestamp
         let timestamp = SystemTime::now()
@@ -371,7 +381,7 @@ fn capture_thread(
         // Write packet in appropriate format
         let write_result = match format {
             CaptureFormat::Jsonl => {
-                let json_line = packet_to_jsonl(&buffer[..packet_len], timestamp.as_micros(), count);
+                let json_line = packet_to_jsonl(&buffer[..packet_len], timestamp.as_micros(), count, is_tap, direction);
                 writeln!(file, "{}", json_line)
             }
             CaptureFormat::Pcap => {
@@ -420,21 +430,67 @@ fn get_interface_index(iface_name: &str) -> Option<i32> {
     }
 }
 
-fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64) -> String {
+fn is_interface_tap(iface_name: &str) -> bool {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return true; // Default to TAP (Ethernet) if we can't check
+    }
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let iface_bytes = iface_name.as_bytes();
+    let copy_len = iface_bytes.len().min(libc::IFNAMSIZ - 1);
+
+    for i in 0..copy_len {
+        ifr.ifr_name[i] = iface_bytes[i] as i8;
+    }
+
+    let result = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as i32, &mut ifr) };
+    unsafe { libc::close(sock); }
+
+    if result == 0 {
+        let flags = unsafe { ifr.ifr_ifru.ifru_flags };
+        // TAP interfaces have BROADCAST flag, TUN interfaces don't
+        flags & libc::IFF_BROADCAST as i16 != 0
+    } else {
+        true // Default to TAP if we can't get flags
+    }
+}
+
+fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64, is_tap: bool, direction: &str) -> String {
     use oside::protocols::all::*;
     use oside::*;
 
-    // Parse packet using oside
-    let layers = match Ether!().ldecode(packet) {
-        Some((stack, _)) => stack.layers,
+    // Parse packet using oside - use appropriate decoder based on interface type
+    let layers = if is_tap {
+        // TAP interface: layer 2 (Ethernet)
+        Ether!().ldecode(packet).map(|(stack, _)| stack.layers)
+    } else {
+        // TUN interface: layer 3 (IP)
+        // Try IPv4 first, then IPv6
+        if !packet.is_empty() {
+            let version = (packet[0] >> 4) & 0x0F;
+            if version == 4 {
+                IP!().ldecode(packet).map(|(stack, _)| stack.layers)
+            } else if version == 6 {
+                IPV6!().ldecode(packet).map(|(stack, _)| stack.layers)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let layers = match layers {
+        Some(l) => l,
         None => {
             // If parsing fails, fallback to hex encoding
             let hex_data: String = packet.iter()
                 .map(|b| format!("{:02x}", b))
                 .collect();
             return format!(
-                r#"{{"timestamp_us":{},"data":"{}"}}"#,
-                timestamp_us, hex_data
+                r#"{{"timestamp_us":{},"direction":"{}","data":"{}"}}"#,
+                timestamp_us, direction, hex_data
             );
         }
     };
@@ -448,13 +504,13 @@ fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64) -> String {
                 .map(|b| format!("{:02x}", b))
                 .collect();
             return format!(
-                r#"{{"timestamp_us":{},"data":"{}"}}"#,
-                timestamp_us, hex_data
+                r#"{{"timestamp_us":{},"direction":"{}","data":"{}"}}"#,
+                timestamp_us, direction, hex_data
             );
         }
     };
 
-    format!(r#"{{"timestamp_us":{},"layers":{}}}"#, timestamp_us, layers_json)
+    format!(r#"{{"timestamp_us":{},"direction":"{}","layers":{}}}"#, timestamp_us, direction, layers_json)
 }
 
 // PCAP file format functions

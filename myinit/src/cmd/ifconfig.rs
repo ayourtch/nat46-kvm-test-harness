@@ -45,6 +45,29 @@ pub fn main(args: &str) {
                     eprintln!("{}", e);
                 }
             }
+            "hw" | "ether" => {
+                // Set MAC address: ifconfig tap0 hw ether 00:11:22:33:44:55
+                // or: ifconfig tap0 ether 00:11:22:33:44:55
+                if i + 1 < parts.len() {
+                    let mac_index = if parts[i] == "hw" && i + 2 < parts.len() && parts[i + 1] == "ether" {
+                        i += 2;
+                        i
+                    } else {
+                        i += 1;
+                        i
+                    };
+
+                    if mac_index < parts.len() {
+                        if let Err(e) = set_mac_address(iface, parts[mac_index]) {
+                            eprintln!("{}", e);
+                        }
+                    } else {
+                        eprintln!("Missing MAC address");
+                    }
+                } else {
+                    eprintln!("Usage: ifconfig {} hw ether <mac>", iface);
+                }
+            }
             _ => {
                 // Check if it looks like an IP address (contains dots)
                 if parts[i].contains('.') {
@@ -628,6 +651,79 @@ fn set_promiscuous_mode(iface_name: &str, enable: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn set_mac_address(iface_name: &str, mac: &str) -> Result<(), String> {
+    println!("Setting MAC address {} on {}...", mac, iface_name);
+
+    // Parse MAC address (format: 00:11:22:33:44:55 or 00-11-22-33-44-55)
+    let mac_parts: Vec<&str> = if mac.contains(':') {
+        mac.split(':').collect()
+    } else if mac.contains('-') {
+        mac.split('-').collect()
+    } else {
+        return Err("Invalid MAC address format. Use 00:11:22:33:44:55".to_string());
+    };
+
+    if mac_parts.len() != 6 {
+        return Err("MAC address must have 6 octets".to_string());
+    }
+
+    let mut mac_bytes = [0u8; 6];
+    for (i, part) in mac_parts.iter().enumerate() {
+        mac_bytes[i] = u8::from_str_radix(part, 16)
+            .map_err(|_| format!("Invalid hex in MAC address: {}", part))?;
+    }
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err("Failed to create socket".to_string());
+    }
+
+    let mut ifr: libc::ifreq = unsafe { mem::zeroed() };
+    let iface_bytes = iface_name.as_bytes();
+    let copy_len = iface_bytes.len().min(libc::IFNAMSIZ - 1);
+    for i in 0..copy_len {
+        ifr.ifr_name[i] = iface_bytes[i] as i8;
+    }
+
+    unsafe {
+        // Check if interface is up
+        if libc::ioctl(sock, libc::SIOCGIFFLAGS as i32, &mut ifr) == 0 {
+            let flags = ifr.ifr_ifru.ifru_flags;
+            if flags & libc::IFF_UP as i16 != 0 {
+                println!("Warning: Interface {} is UP. Some interfaces require being DOWN to change MAC.", iface_name);
+                println!("If this fails, try: ifconfig {} down", iface_name);
+            }
+        }
+
+        // Reset ifr for setting MAC
+        for i in 0..copy_len {
+            ifr.ifr_name[i] = iface_bytes[i] as i8;
+        }
+
+        // Set hardware address
+        let hwaddr = &mut ifr.ifr_ifru.ifru_hwaddr;
+        hwaddr.sa_family = libc::ARPHRD_ETHER as u16;
+        for i in 0..6 {
+            hwaddr.sa_data[i] = mac_bytes[i] as i8;
+        }
+
+        if libc::ioctl(sock, libc::SIOCSIFHWADDR as i32, &mut ifr) < 0 {
+            let errno = *libc::__errno_location();
+            libc::close(sock);
+
+            if errno == 16 { // EBUSY
+                return Err(format!("Device busy (errno {}). Try: ifconfig {} down", errno, iface_name));
+            }
+            return Err(format!("Failed to set MAC address: errno {}", errno));
+        }
+
+        libc::close(sock);
+    }
+
+    println!("Successfully set MAC address {} on {}", mac, iface_name);
+    Ok(())
+}
+
 pub fn help_text() -> &'static str {
-    "ifconfig [iface] [config]         - Configure network interfaces (up/down/promisc/-promisc)"
+    "ifconfig [iface] [config]         - Configure network interfaces (up/down/promisc/hw ether <mac>)"
 }
