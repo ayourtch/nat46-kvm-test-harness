@@ -167,8 +167,10 @@ impl Editor {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Number(n) => n.to_string(),
                     serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Array(_) => format!("{:?}", value),
-                    serde_json::Value::Object(_) => format!("{:?}", value),
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        // Use proper JSON serialization for complex types
+                        serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+                    },
                     serde_json::Value::Null => "null".to_string(),
                 };
                 fields.push((key.clone(), value_str));
@@ -315,8 +317,14 @@ impl Editor {
 
         // Update the field
         if let Some(obj) = json.as_object_mut() {
-            // Try to parse as number, otherwise use string
-            let new_val = if let Ok(n) = new_value.parse::<i64>() {
+            // Get original value to determine type
+            let original_value = obj.get(field_name);
+
+            let new_val = if new_value.starts_with('[') || new_value.starts_with('{') {
+                // Try to parse as JSON for arrays/objects
+                serde_json::from_str(new_value)
+                    .unwrap_or_else(|_| serde_json::Value::String(new_value.clone()))
+            } else if let Ok(n) = new_value.parse::<i64>() {
                 serde_json::Value::Number(n.into())
             } else if let Ok(n) = new_value.parse::<f64>() {
                 serde_json::Number::from_f64(n)
@@ -324,8 +332,25 @@ impl Editor {
                     .unwrap_or_else(|| serde_json::Value::String(new_value.clone()))
             } else if new_value == "true" || new_value == "false" {
                 serde_json::Value::Bool(new_value == "true")
+            } else if new_value == "null" {
+                serde_json::Value::Null
+            } else if new_value.starts_with('"') && new_value.ends_with('"') {
+                // Quoted string - remove quotes
+                let unquoted = &new_value[1..new_value.len()-1];
+                serde_json::Value::String(unquoted.to_string())
             } else {
-                serde_json::Value::String(new_value.clone())
+                // Keep original type structure if possible
+                match original_value {
+                    Some(serde_json::Value::Number(_)) => {
+                        // Try harder to parse as number
+                        if let Ok(n) = new_value.parse::<i64>() {
+                            serde_json::Value::Number(n.into())
+                        } else {
+                            serde_json::Value::String(new_value.clone())
+                        }
+                    }
+                    _ => serde_json::Value::String(new_value.clone())
+                }
             };
 
             obj.insert(field_name.clone(), new_val);
