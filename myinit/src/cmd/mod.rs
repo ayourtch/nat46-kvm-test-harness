@@ -44,6 +44,7 @@ define_commands! {
     echo,
     help,
     ifconfig,
+    inject,
     insmod,
     ip,
     ls,

@@ -1,6 +1,13 @@
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::mem;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+// Global registry of TAP interface file descriptors
+lazy_static::lazy_static! {
+    pub static ref TAP_FDS: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
+}
 
 pub fn main(args: &str) {
     let args = args.trim();
@@ -25,7 +32,9 @@ pub fn main(args: &str) {
     match action {
         "add" => {
             match create_tap_interface(name) {
-                Ok(_) => {
+                Ok(fd) => {
+                    // Store the file descriptor in the global registry
+                    TAP_FDS.lock().unwrap().insert(name.to_string(), fd);
                     println!("Successfully created TAP interface '{}'", name);
                 }
                 Err(e) => {
@@ -117,4 +126,9 @@ fn print_usage() {
 
 pub fn help_text() -> &'static str {
     "tap add <name>                    - Create TAP interface"
+}
+
+// Public function to get TAP FD for other commands (like inject)
+pub fn get_tap_fd(name: &str) -> Option<i32> {
+    TAP_FDS.lock().unwrap().get(name).copied()
 }
