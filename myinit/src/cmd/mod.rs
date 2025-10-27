@@ -53,6 +53,7 @@ define_commands! {
     mknod,
     mount,
     netcat,
+    oside,
     pcap2json,
     ping,
     poweroff,
