@@ -42,6 +42,7 @@ define_commands! {
     capture,
     dmesg,
     echo,
+    edit,
     help,
     ifconfig,
     inject,
