@@ -44,6 +44,7 @@ define_commands! {
     droptrace,
     echo,
     edit,
+    fakehost,
     help,
     ifconfig,
     inject,

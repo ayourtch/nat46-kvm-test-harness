@@ -4,24 +4,39 @@
 
 This is a custom Rust-based init program (`myinit`) designed to run as PID 1 in a minimal Linux environment (firecracker/KVM VM). It serves as a **script-based system initialization** and interactive shell environment for testing the nat46 kernel module and network configurations.
 
+**Key Focus:** Network testing, packet manipulation, NAT46 debugging with powerful built-in tools.
+
 ## Architecture
 
 ### Directory Structure
 ```
-/home/ayourtch/fun/nat46/harness/myinit/
+/home/ayourtch/rust/nat46-kvm-test-harness/myinit/
 ├── src/
 │   ├── main.rs                 # Core init with script executor (297 lines)
 │   └── cmd/                    # Command modules (auto-discovered)
 │       ├── mod.rs              # Auto-generation macro
 │       ├── cat.rs              # Display file contents
+│       ├── capture.rs          # Packet capture (PCAP/JSONL) with smart TAP/TUN detection
 │       ├── dmesg.rs            # Display kernel messages
+│       ├── droptrace.rs        # Kernel packet drop tracer (skb:kfree_skb)
 │       ├── echo.rs             # Echo text to output
+│       ├── edit.rs             # VT100 text editor
+│       ├── fakehost.rs         # Fake host ARP responder
 │       ├── help.rs             # Auto-generated help
 │       ├── ifconfig.rs         # Network interface configuration
+│       ├── inject.rs           # Packet injection with timing
 │       ├── insmod.rs           # Load kernel modules
+│       ├── ip.rs               # IP routing commands
+│       ├── json2pcap.rs        # Convert JSONL to PCAP
+│       ├── kconfig.rs          # Check kernel configuration
 │       ├── ls.rs               # List directory contents
+│       ├── mkdir.rs            # Create directories
 │       ├── mknod.rs            # Create device nodes
 │       ├── mount.rs            # Mount filesystems
+│       ├── netcat.rs           # Network connectivity tool
+│       ├── oside.rs            # Interactive packet editor
+│       ├── pcap2json.rs        # Convert PCAP to JSONL
+│       ├── ping.rs             # ICMP ping utility
 │       ├── poweroff.rs         # System shutdown
 │       ├── ps.rs               # Display running processes
 │       ├── run.rs              # Execute script files
@@ -95,36 +110,61 @@ After initialization, the system has a **two-stage countdown**:
 
 This allows users to place custom initialization scripts without recompiling!
 
-### 3. Interactive Shell
+### 3. Interactive Shell with Powerful Networking Tools
 
-The program provides an interactive shell with **auto-discovered commands**:
+The program provides an interactive shell with **auto-discovered commands** (27 total):
 
-#### Available Commands (13 total)
-
-**File Operations:**
+#### File Operations
 - `cat <file>` - Display file contents
 - `ls [path]` - List directory contents
 - `echo <text>` - Echo text to output
+- `edit <file>` - VT100 text editor (Ctrl+S save, Ctrl+Q quit, Ctrl+X save+exit)
+- `mkdir [-p] <dir>` - Create directories
 
-**Process Operations:**
+#### Process Operations
 - `ps` - Display running processes
 
-**Network Operations:**
+#### Network Configuration
 - `ifconfig` - Display all network interfaces
 - `ifconfig <iface>` - Display specific interface
 - `ifconfig <iface> <ip> [netmask <mask>]` - Set IPv4 address
 - `ifconfig <iface> <ipv6/prefix>` - Set IPv6 address
-- `ifconfig <iface> up` - Bring interface up
-- `ifconfig <iface> down` - Bring interface down
+- `ifconfig <iface> up/down` - Bring interface up/down
+- `ifconfig <iface> promisc/-promisc` - Enable/disable promiscuous mode
+- `ifconfig <iface> hw ether <mac>` - Set MAC address
 - `tap add <name>` - Create TAP interface
+- `ip route ...` - IP routing configuration
 
-**System Operations:**
+#### Network Testing & Debugging
+- `ping <destination>` - ICMP ping utility
+- `netcat` - Network connectivity tool
+- `fakehost add <iface> <ipv4>` - Add fake host responding to ARP
+- `fakehost del <iface> <ipv4>` - Remove fake host
+- `fakehost show` - Show all fake hosts
+
+#### Packet Capture & Analysis
+- `capture start <iface> <file> [jsonl|pcap] [count]` - Start packet capture (auto-detects L2/L3)
+- `capture stop <iface>` - Stop capture
+- `capture show` - Show active captures
+- `inject <pcap|jsonl> <iface>` - Replay packets with original timing
+- `pcap2json <input.pcap> <output.jsonl>` - Convert PCAP to JSONL
+- `json2pcap <input.jsonl> <output.pcap>` - Convert JSONL to PCAP
+- `oside <file.jsonl>` - Interactive packet editor with layer/field manipulation
+
+#### Kernel Debugging
+- `droptrace start [count]` - Start tracing packet drops (background)
+- `droptrace stop` - Stop tracing
+- `droptrace show` - Show captured drops
+- `droptrace clear` - Clear drop buffer
+- `kconfig tracing` - Check kernel tracing support
+- `dmesg [lines]` - Display kernel messages
+
+#### System Operations
 - `mount proc` - Mount /proc filesystem
 - `mount 9p` - Mount 9p filesystem at /mnt/host
 - `mount -t <type> <src> <tgt> [-o <opts>]` - Mount filesystem
 - `insmod <module>` - Load kernel module
 - `mknod <path> <type> <maj> <min>` - Create device node
-- `dmesg [lines]` - Display kernel messages
 - `run <script>` - Run script file (one command per line)
 - `help [command]` - Show help for commands
 - `poweroff` - Shutdown the system
@@ -132,30 +172,10 @@ The program provides an interactive shell with **auto-discovered commands**:
 #### Output Redirection
 
 All commands support output redirection:
-```
-<command> > <file>
-```
-
-Examples:
-- `ls / > /tmp/rootdir.txt`
-- `ifconfig > /tmp/interfaces.txt`
-- `echo add nat46dev > /proc/net/nat46/control`
-
-### 4. Script Execution
-
-Script files support:
-- One command per line
-- Comments (lines starting with `#`)
-- Empty lines (ignored)
-- Output redirection
-
-Example `/autoexec.run`:
 ```bash
-# Custom initialization
-echo "Running custom init..."
-ifconfig tap0 10.0.0.1 netmask 255.255.255.0
-mount -t 9p extra-share /mnt/extra
-ls /mnt/host > /tmp/host-contents.txt
+ls / > /tmp/rootdir.txt
+ifconfig > /tmp/interfaces.txt
+echo add nat46dev > /proc/net/nat46/control
 ```
 
 ## Auto-Generated Command System
@@ -167,14 +187,27 @@ ls /mnt/host > /tmp/host-contents.txt
 ```rust
 define_commands! {
     cat,
+    capture,
     dmesg,
+    droptrace,
     echo,
+    edit,
+    fakehost,
     help,
     ifconfig,
+    inject,
     insmod,
+    ip,
+    json2pcap,
+    kconfig,
     ls,
+    mkdir,
     mknod,
     mount,
+    netcat,
+    oside,
+    pcap2json,
+    ping,
     poweroff,
     ps,
     run,
@@ -202,19 +235,333 @@ This macro **automatically generates**:
    ```
 3. Add `newcomand` to the list in `cmd/mod.rs`
 
-**That's it!** Everything else is auto-generated:
-- Command dispatch
-- Help text aggregation
-- Module exports
+**That's it!** Everything else is auto-generated.
 
-### Benefits
+## Advanced Features
 
-- ✅ **Single source of truth**: One list defines everything
-- ✅ **Zero duplication**: DRY principle perfected
-- ✅ **Auto-generated dispatch**: No manual match arms
-- ✅ **Auto-generated help**: Collected from all modules
-- ✅ **Compile-time checked**: Typos = compile errors
-- ✅ **Impossible to forget**: Can't add module without adding to list
+### Packet Capture with Smart TAP/TUN Detection
+
+The `capture` command automatically detects whether an interface is:
+- **L2-ethernet (TAP)**: Has `IFF_BROADCAST` flag → uses Ethernet decoder
+- **L3 (TUN)**: No `IFF_BROADCAST` flag → uses IP/IPv6 decoder
+
+```bash
+capture start nat46 nat46.jsonl
+# Detected L3 interface
+
+capture start tap0 tap0.jsonl pcap
+# Detected L2-ethernet interface
+```
+
+**Features:**
+- Auto-detects interface type using `IFF_BROADCAST` flag
+- Bidirectional capture (tags packets as "rx" or "tx")
+- JSONL format with oside structured parsing
+- PCAP format for Wireshark compatibility
+- Background operation
+- Packet count limit support
+
+**JSONL Format:**
+```json
+{
+  "timestamp_us": 1761596197426295,
+  "direction": "rx",
+  "layers": [
+    {"layertype": "Ip", "src": "192.168.1.1", "dst": "10.0.0.1", ...},
+    {"layertype": "Tcp", "sport": 12345, "dport": 80, ...}
+  ]
+}
+```
+
+### Packet Injection with Timing Preservation
+
+The `inject` command replays packets at their original capture timing:
+
+```bash
+inject capture.jsonl tap0
+inject capture.pcap tap0
+```
+
+**Features:**
+- Preserves original packet timing
+- Auto-detects PCAP vs JSONL format
+- Uses TAP file descriptor registry for direct injection
+- Falls back to AF_PACKET raw sockets
+- Supports both hex-encoded and oside structured JSONL
+
+### Interactive Packet Editor (oside)
+
+Full-featured packet editor with layer/field manipulation:
+
+```bash
+oside packets.jsonl
+```
+
+**Features:**
+- **Navigation:** Arrow keys to move between packets, layers, and fields
+- **Timestamp editing:** Layer -1 (simplified architecture)
+- **Layer management:**
+  - `a` - Add new layer (Ethernet, IP, IPv6, TCP, UDP, ICMP, ARP, Raw)
+  - `r` - Remove current layer
+- **Field editing:**
+  - `e` - Edit current field
+  - Supports complex JSON fields (IPv4 flags, etc.)
+  - Arrow keys, Home, End, Delete, Backspace
+  - Ctrl+A/E - Jump to start/end
+  - Ctrl+K/U - Kill to end/start
+  - Enter - Save, Esc - Cancel
+- **Auto field calculation:**
+  - `f` - Recalculate checksums, lengths, etc.
+- **Packet operations:**
+  - `n`/`p` - Next/previous packet
+  - `d` - Delete packet
+  - `c` - Copy packet
+  - `s` - Save file
+  - `q` - Quit (with unsaved changes warning)
+
+**Architecture highlight:** Uses layer -1 for timestamp, eliminating field index adjustments throughout the codebase.
+
+### Fake Host ARP Responder
+
+Create virtual hosts that respond to ARP requests without needing real machines:
+
+```bash
+fakehost add tap0 192.168.1.10
+fakehost add tap0 192.168.1.20
+fakehost show
+fakehost del tap0 192.168.1.10
+```
+
+**Features:**
+- Runs in background thread per interface
+- Monitors TAP interface for ARP requests
+- Automatically responds with interface's MAC address
+- Multiple IPs per interface
+- Perfect for NAT46 testing without real hosts
+
+**Output:**
+```
+ARP: Who has 192.168.1.10? Tell 192.168.1.5 - Responding with MAC 02:42:ac:11:00:02
+```
+
+**Note:** Currently IPv4/ARP only. IPv6/NDP support planned.
+
+### Kernel Packet Drop Tracer
+
+Real-time kernel packet drop tracing using `skb:kfree_skb` tracepoint:
+
+```bash
+droptrace start
+# Do your network tests...
+droptrace show
+droptrace stop
+```
+
+**Features:**
+- Runs in background, doesn't block shell
+- Automatically mounts tracefs/debugfs if needed
+- Shows drop location (kernel function) and reason
+- Buffers last 1000 drops
+- Optional packet count limit
+
+**Output:**
+```
+COMM                 PID        CPU      LOCATION                                           REASON
+----------------------------------------------------------------------------------------------------
+init                 1          000      ip_rcv_core+0x274/0x390                            OTHERHOST
+ping                 123        000      icmp_rcv+0x245                                     NO_ROUTE
+```
+
+**Common drop reasons:**
+- `OTHERHOST` - Destination MAC doesn't match (enable promiscuous mode)
+- `NO_SOCKET` - No listening socket
+- `NO_ROUTE` - No route to destination
+- And many more...
+
+### Network Interface Advanced Configuration
+
+Extended `ifconfig` capabilities:
+
+```bash
+# Promiscuous mode (accept all packets)
+ifconfig tap0 promisc
+ifconfig tap0 -promisc
+
+# MAC address change
+ifconfig tap0 down
+ifconfig tap0 hw ether 02:42:ac:11:00:02
+ifconfig tap0 up
+
+# Status shows new fields
+ifconfig tap0
+#   HWaddr: 02:42:ac:11:00:02
+#   Flags: UP BROADCAST RUNNING PROMISC MULTICAST
+```
+
+### TAP File Descriptor Registry
+
+Global registry for sharing TAP file descriptors between commands:
+
+```rust
+// In tap.rs
+lazy_static! {
+    pub static ref TAP_FDS: Mutex<HashMap<String, i32>> = ...;
+}
+```
+
+**Used by:**
+- `inject` - Direct packet injection into TAP
+- `fakehost` - Reading/writing to TAP for ARP responses
+
+**Benefits:**
+- No EBUSY errors from multiple attachments
+- Efficient packet injection
+- Shared access across commands
+
+## Implementation Details
+
+### Script Execution
+
+The `execute_script()` function:
+```rust
+pub fn execute_script(script: &str) {
+    for line in script.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        execute_line(line);
+    }
+}
+```
+
+### Command Line Parsing
+
+The `execute_line()` function handles:
+- Parsing command and arguments
+- Output redirection detection (`>`)
+- Stdout redirection and restoration
+
+### Network Interface Management
+
+Uses ioctl syscalls for network configuration:
+- `SIOCGIFFLAGS` / `SIOCSIFFLAGS` - Get/set interface flags (including IFF_PROMISC)
+- `SIOCGIFADDR` / `SIOCSIFADDR` - Get/set IPv4 address
+- `SIOCGIFNETMASK` / `SIOCSIFNETMASK` - Get/set netmask
+- `SIOCGIFHWADDR` / `SIOCSIFHWADDR` - Get/set MAC address
+- `SIOCGIFINDEX` - Get interface index
+- `SIOCGIFMTU` - Get MTU
+- `TUNSETIFF` - Create TAP interface
+
+IPv6 addresses:
+- Uses `in6_ifreq` structure with ioctl `SIOCSIFADDR` (0x8916)
+- Reads from `/proc/net/if_inet6` to display addresses
+
+### TAP Interface Setup
+
+TAP interfaces are created using:
+1. Open `/dev/net/tun`
+2. Use `TUNSETIFF` ioctl with `IFF_TAP | IFF_NO_PI` flags
+3. Store file descriptor in global registry
+4. Keep FD open (using `mem::forget`) to maintain interface
+
+### Packet Capture Implementation
+
+Uses `AF_PACKET` raw sockets:
+1. Create raw packet socket
+2. Bind to specific interface
+3. Check interface flags to determine TAP vs TUN
+4. Use `recvfrom` to get packet with direction info (sll_pkttype)
+5. Parse with appropriate oside decoder (Ether vs IP/IPV6)
+6. Tag with "rx" or "tx" direction
+7. Write to JSONL or PCAP file
+
+### Packet Injection Implementation
+
+1. Parse file format (PCAP or JSONL)
+2. Extract packets with timestamps
+3. Check TAP FD registry first
+4. If TAP FD available, use `write()` for direct injection
+5. Otherwise, use AF_PACKET raw socket with `send()`
+6. Preserve timing with `thread::sleep(Duration)`
+
+### oside Integration
+
+The oside library provides:
+- Layer trait for all protocol types
+- LayerStack for composing packets
+- Encoders/decoders for each protocol
+- Automatic field calculation (fill() method)
+- Serialization/deserialization support
+
+**Usage pattern:**
+```rust
+// Parsing
+let (stack, _) = Ether!().ldecode(packet)?;
+
+// Construction
+let packet = Ether!(dst = "ff:ff:ff:ff:ff:ff", src = "...", etype = 0x0806)
+           / ARP!(op = 1, ...);
+let bytes = packet.lencode();
+
+// Auto-fill checksums
+let stack = LayerStack { filled: false, layers };
+let filled = stack.fill();
+```
+
+### Kernel Tracing Infrastructure
+
+Uses kernel ftrace/tracepoints via sysfs:
+1. Mount tracefs at `/sys/kernel/tracing` or debugfs at `/sys/kernel/debug`
+2. Enable tracepoint: `echo 1 > /sys/kernel/tracing/events/skb/kfree_skb/enable`
+3. Read from `trace_pipe` (blocking, real-time)
+4. Parse output to extract drop location and reason
+5. Buffer in memory (VecDeque with 1000 entry limit)
+6. Run in background thread
+
+### 9P Filesystem
+
+Mount options used:
+```
+trans=virtio,version=9p2000.L
+```
+
+The mount will fail with "No such device" (errno 19) if:
+- Kernel modules aren't loaded
+- The `host-code` tag doesn't match the KVM `-device` parameter
+- The 9p filesystem isn't registered in the kernel
+
+### Output Redirection Implementation
+
+Uses file descriptor manipulation:
+1. Save stdout with `dup(1)`
+2. Open output file
+3. Redirect stdout to file with `dup2(fd, 1)`
+4. Execute command
+5. Restore stdout with `dup2(saved_stdout, 1)`
+6. Close temporary descriptors
+
+## Build and Deployment
+
+### Building
+```bash
+cargo build --release
+```
+
+The binary will be at: `target/x86_64-unknown-linux-musl/release/myinit`
+
+### Dependencies
+- libc 0.2.177
+- lazy_static (for global state)
+- serde, serde_json (for JSON handling)
+- oside (packet manipulation library)
+
+### Creating initrd
+
+The initrd should contain:
+- `myinit` binary (as `/init`)
+- Kernel modules (`.ko` files) in root directory
+- Optional: `/autoexec.run` script for custom initialization
 
 ## KVM/Firecracker Setup
 
@@ -248,118 +595,23 @@ Key parameters:
 - Host path: `/home/ayourtch/fun/nat46/`
 - Mount point in guest: `/mnt/host`
 
-## Implementation Details
+## Debugging
 
-### Script Execution
+### When things go wrong, check:
+1. Kernel messages: `dmesg`
+2. Available filesystems: `cat /proc/filesystems`
+3. Network interfaces: `ifconfig` or `cat /proc/net/dev`
+4. IPv6 addresses: `cat /proc/net/if_inet6`
+5. Module dependencies: check load order
+6. Packet drops: `droptrace start`
+7. Kernel tracing: `kconfig tracing`
 
-The `execute_script()` function:
-```rust
-pub fn execute_script(script: &str) {
-    for line in script.lines() {
-        let line = line.trim();
-
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        execute_line(line);
-    }
-}
-```
-
-### Command Line Parsing
-
-The `execute_line()` function handles:
-- Parsing command and arguments
-- Output redirection detection (`>`)
-- Stdout redirection and restoration
-
-### Network Interface Management
-
-Uses ioctl syscalls for network configuration:
-- `SIOCGIFFLAGS` / `SIOCSIFFLAGS` - Get/set interface flags
-- `SIOCGIFADDR` / `SIOCSIFADDR` - Get/set IPv4 address
-- `SIOCGIFNETMASK` / `SIOCSIFNETMASK` - Get/set netmask
-- `SIOCGIFINDEX` - Get interface index
-- `SIOCGIFMTU` - Get MTU
-- `TUNSETIFF` - Create TAP interface
-
-IPv6 addresses:
-- Uses `in6_ifreq` structure with ioctl `SIOCSIFADDR` (0x8916)
-- Reads from `/proc/net/if_inet6` to display addresses
-
-### TAP Interface Setup
-
-TAP interfaces are created using:
-1. Open `/dev/net/tun`
-2. Use `TUNSETIFF` ioctl with `IFF_TAP | IFF_NO_PI` flags
-3. Keep file descriptor open (using `mem::forget`) to maintain interface
-
-### 9P Filesystem
-
-Mount options used:
-```
-trans=virtio,version=9p2000.L
-```
-
-The mount will fail with "No such device" (errno 19) if:
-- Kernel modules aren't loaded
-- The `host-code` tag doesn't match the KVM `-device` parameter
-- The 9p filesystem isn't registered in the kernel
-
-### Output Redirection Implementation
-
-Uses file descriptor manipulation:
-1. Save stdout with `dup(1)`
-2. Open output file
-3. Redirect stdout to file with `dup2(fd, 1)`
-4. Execute command
-5. Restore stdout with `dup2(saved_stdout, 1)`
-6. Close temporary descriptors
-
-## Build and Deployment
-
-### Building
-```bash
-cargo build --release
-```
-
-The binary will be at: `target/x86_64-unknown-linux-musl/release/myinit`
-
-### Creating initrd
-
-The initrd should contain:
-- `myinit` binary (as `/init`)
-- Kernel modules (`.ko` files) in root directory
-- Optional: `/autoexec.run` script for custom initialization
-
-### Debugging
-
-When things go wrong, check:
-1. Kernel messages (use `dmesg` command)
-2. `/proc/filesystems` for available filesystem types
-3. `/proc/net/dev` for network interfaces
-4. `/proc/net/if_inet6` for IPv6 addresses
-5. Module dependencies (use `lsmod` on host to see load order)
-
-## Important Notes
-
-### Module Load Order
-
-Critical dependencies:
-- `netfs.ko` must be loaded before `9p.ko` (provides fscache functionality)
-- `nf_defrag_ipv6.ko` must be loaded before `nat46.ko` (provides `nf_ct_frag6_gather`)
-- `9pnet.ko` and `9pnet_virtio.ko` before `9p.ko`
-
-### Error Messages
-
-Common errors and solutions:
+### Common Issues and Solutions
 
 **"Unknown symbol nf_ct_frag6_gather (err -2)"**
 - Missing `nf_defrag_ipv6.ko`
 
-**"Unknown symbol __fscache_acquire_volume (err -2)"** (and related)
+**"Unknown symbol __fscache_acquire_volume (err -2)"**
 - Missing `netfs.ko`
 
 **"No such device" (errno 19) on 9p mount**
@@ -370,19 +622,121 @@ Common errors and solutions:
 - Module file doesn't exist
 - Module dependencies not loaded
 
-### stdin/stdout Management
+**OTHERHOST packet drops**
+- Enable promiscuous mode: `ifconfig <iface> promisc`
 
-The program uses stdin in non-blocking mode during countdown and blocking mode during interactive shell. The `set_stdin_nonblocking()` function toggles this using `fcntl`.
+**Can't inject packets to TAP**
+- Make sure TAP was created with `tap add` command
+- Check TAP FD registry with fakehost or inject
+
+**Tracing not available**
+- Check kernel config: `kconfig tracing`
+- Ensure debugfs or tracefs support compiled in kernel
+- Try manual mount: `mount -t tracefs none /sys/kernel/tracing`
+
+## Example Workflows
+
+### NAT46 Testing with Fake Hosts
+
+```bash
+# Setup interfaces
+tap add tap0
+tap add tap1
+ifconfig tap0 192.168.1.1 netmask 255.255.255.0 up promisc
+ifconfig tap1 2001:db8::1/64 up promisc
+
+# Add fake hosts
+fakehost add tap0 192.168.1.10
+fakehost add tap0 192.168.1.20
+
+# Start captures and drop tracing
+capture start tap0 tap0.jsonl
+capture start tap1 tap1.jsonl
+droptrace start
+
+# Do your NAT46 tests...
+# (packets will be captured, drops traced, ARP handled)
+
+# Check results
+capture show
+droptrace show
+fakehost show
+
+# Stop everything
+capture stop tap0
+capture stop tap1
+droptrace stop
+```
+
+### Packet Replay and Analysis
+
+```bash
+# Capture packets
+capture start tap0 original.jsonl 100
+
+# Edit packets
+oside original.jsonl
+# (modify addresses, ports, etc.)
+
+# Replay modified packets
+inject original.jsonl tap1
+
+# Convert to PCAP for Wireshark
+json2pcap original.jsonl original.pcap
+```
+
+### Custom Network Configuration
+
+Create `/autoexec.run`:
+```bash
+# Custom network setup
+echo "Configuring custom network..."
+
+# Create and configure interfaces
+tap add tap0
+ifconfig tap0 172.16.0.1 netmask 255.255.255.0 up promisc
+ifconfig tap0 hw ether 02:42:ac:11:00:01
+
+# Add fake hosts
+fakehost add tap0 172.16.0.10
+fakehost add tap0 172.16.0.20
+
+# Start background monitoring
+droptrace start
+capture start tap0 /mnt/host/tap0.jsonl
+```
+
+### Test Automation
+
+Create `/autoexec.run`:
+```bash
+# Automated testing
+echo "Running automated tests..."
+
+# Start monitoring
+droptrace start
+capture start nat46 /tmp/nat46.jsonl 1000
+
+# Run tests
+ping -c 10 192.168.1.1 > /tmp/ping-results.txt
+
+# Gather results
+droptrace show > /tmp/drops.txt
+capture stop nat46
+ifconfig > /tmp/interfaces.txt
+ps > /tmp/processes.txt
+
+echo "Tests complete"
+poweroff
+```
 
 ## Code Statistics
 
-**Massive Refactoring Achievement:**
-- **Original main.rs**: 1,083 lines
-- **Final main.rs**: 297 lines
-- **Reduction**: 786 lines removed (73% reduction!)
-- **Total project**: 1,733 lines
-- **Binary size**: 690KB
-- **Command modules**: 13 commands
+- **Total commands**: 27
+- **Main.rs**: 297 lines (73% reduction from original)
+- **Command modules**: ~5000 lines total
+- **Binary size**: ~2MB (with oside)
+- **Build time**: ~5 seconds
 
 **Main.rs Functions (Only 9!):**
 1. `set_stdin_nonblocking()` - Stdin management
@@ -395,87 +749,55 @@ The program uses stdin in non-blocking mode during countdown and blocking mode d
 8. `interactive_shell()` - Interactive mode
 9. `main()` - Boot orchestration
 
-## Testing Checklist
-
-When testing changes:
-- [ ] Startup script executes successfully
-- [ ] Modules load successfully
-- [ ] TAP interfaces created with correct IPs
-- [ ] 9P mount succeeds (check `/mnt/host`)
-- [ ] Autoexec countdown works (5 seconds)
-- [ ] `/autoexec.run` executes if present
-- [ ] Shutdown countdown works (10 seconds)
-- [ ] Interactive shell responds to commands
-- [ ] Output redirection works
-- [ ] Script execution works (`run` command)
-- [ ] Help auto-generation works
-- [ ] Poweroff shuts down cleanly
-
 ## Architecture Highlights
 
 ### Pure Command-Driven Design
-
 - **Everything** is a command (even `help` and `poweroff`)
 - Boot sequence is a **literal shell script** embedded in Rust
 - External scripts via `/autoexec.run` for customization
 - Zero hardcoded logic - all operations use composable commands
 
 ### Macro-Driven Auto-Generation
-
 - Single list of commands in `cmd/mod.rs`
 - Automatic command dispatch generation
 - Automatic help text aggregation
 - Adding commands is trivial (3 steps)
 
 ### Script-First Philosophy
-
 - Built-in startup script
 - Auto-execute support (`/autoexec.run`)
 - Interactive script execution (`run` command)
 - All scripts support comments and output redirection
 
-## Example Use Cases
-
-### Custom Network Configuration
-
-Create `/autoexec.run`:
-```bash
-# Custom network setup
-echo "Configuring custom network..."
-tap add tap2
-ifconfig tap2 172.16.0.1 netmask 255.255.255.0
-ifconfig tap2 fd00::1/64
-ifconfig tap2 up
-```
-
-### Test Automation
-
-Create `/autoexec.run`:
-```bash
-# Automated testing
-echo "Running automated tests..."
-ls /proc/net/nat46 > /tmp/nat46-check.txt
-ifconfig > /tmp/interfaces.txt
-ps > /tmp/processes.txt
-echo "Tests complete"
-poweroff
-```
-
-### Development Workflow
-
-1. Mount host directory via 9P
-2. Run scripts from `/mnt/host/scripts/`
-3. Iterate without rebuilding initrd
+### Network Testing Focus
+- Comprehensive packet capture/injection tools
+- Smart L2/L3 detection
+- Fake host ARP responder
+- Kernel-level drop tracing
+- Interactive packet editor
+- Bidirectional traffic visibility
 
 ## References
 
-- nat46 module location: `/home/ayourtch/fun/nat46/`
-- Kernel version: 6.8.0-85-generic (based on module compatibility)
-- Rust edition: 2021
-- libc version: 0.2.177
+- **Project location**: `/home/ayourtch/rust/nat46-kvm-test-harness/myinit/`
+- **nat46 module**: `/home/ayourtch/fun/nat46/`
+- **Kernel version**: 6.8.0-85-generic
+- **Rust edition**: 2021
+- **Key dependencies**:
+  - libc 0.2.177
+  - oside (packet manipulation library from https://github.com/ayourtch/oside)
+  - lazy_static
+  - serde/serde_json
 
 ---
 
-**Last updated:** 2025-10-23
-**Session type:** Complete refactoring to script-based, auto-generated command system
-**Achievement:** 73% code reduction, full automation, perfect modularity
+**Last updated:** 2025-01-27
+**Session type:** Network testing tools - packet capture/injection, drop tracing, fake hosts, oside integration
+**Key achievements:**
+- 27 commands total
+- Smart TAP/TUN detection
+- Bidirectional packet capture
+- Interactive packet editor with layer -1 architecture
+- Kernel drop tracer with background operation
+- Fake host ARP responder
+- Complete packet manipulation pipeline (capture → edit → replay)
