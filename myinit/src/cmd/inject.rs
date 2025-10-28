@@ -78,6 +78,8 @@ pub fn main(args: &str) {
             let delay_us = packet.timestamp_us.saturating_sub(prev_ts);
             if delay_us > 0 && delay_us < 10_000_000 {  // Cap at 10 seconds
                 thread::sleep(Duration::from_micros(delay_us as u64));
+            } else if delay_us >= 10_000_000 {
+                eprintln!("Warning: Packet {}: delay too large ({}ms), skipped", injected + 1, delay_us / 1000);
             }
         }
 
