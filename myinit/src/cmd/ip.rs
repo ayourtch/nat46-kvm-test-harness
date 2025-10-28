@@ -106,6 +106,44 @@ pub fn main(args: &str) {
                 }
             }
         }
+        "neigh" | "neighbor" | "neighbour" => {
+            if parts.len() <= args_offset + 1 {
+                // Default to "show"
+                show_neighbors(is_ipv6, None);
+            } else {
+                match parts[args_offset + 1] {
+                    "show" | "list" => {
+                        // Check for "dev <interface>" argument
+                        let device = if parts.len() > args_offset + 2 && parts[args_offset + 2] == "dev" {
+                            if parts.len() > args_offset + 3 {
+                                Some(parts[args_offset + 3])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        show_neighbors(is_ipv6, device);
+                    }
+                    "add" => {
+                        let neigh_args = &parts[args_offset + 2..];
+                        add_neighbor(neigh_args);
+                    }
+                    "del" | "delete" => {
+                        let neigh_args = &parts[args_offset + 2..];
+                        del_neighbor(neigh_args);
+                    }
+                    "flush" => {
+                        let neigh_args = &parts[args_offset + 2..];
+                        flush_neighbors(neigh_args);
+                    }
+                    _ => {
+                        eprintln!("Unknown neighbor command: {}", parts[args_offset + 1]);
+                        print_usage();
+                    }
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown ip command: {}", parts[args_offset]);
             print_usage();
@@ -128,6 +166,11 @@ fn print_usage() {
     eprintln!("    ip addr del <addr/prefix> dev <if>           - Delete IPv4 address");
     eprintln!("    ip -6 addr add <addr/prefix> dev <if>        - Add IPv6 address");
     eprintln!("    ip -6 addr del <addr/prefix> dev <if>        - Delete IPv6 address");
+    eprintln!("  Neighbors:");
+    eprintln!("    ip neigh [show] [dev <if>]                   - Show neighbor cache (ARP/NDP)");
+    eprintln!("    ip neigh add <ip> lladdr <mac> dev <if>      - Add static neighbor entry");
+    eprintln!("    ip neigh del <ip> dev <if>                   - Delete neighbor entry");
+    eprintln!("    ip neigh flush dev <if>                      - Flush neighbors for interface");
 }
 
 fn show_ipv4_routes() {
@@ -440,6 +483,9 @@ const RTM_DELROUTE: u16 = 25;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_CREATE: u16 = 0x400;
@@ -452,6 +498,9 @@ const RTA_OIF: u16 = 4;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
+
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -498,6 +547,27 @@ struct ifaddrmsg {
     ifa_scope: u8,
     ifa_index: u32,
 }
+
+#[repr(C)]
+struct ndmsg {
+    ndm_family: u8,
+    ndm_pad1: u8,
+    ndm_pad2: u16,
+    ndm_ifindex: i32,
+    ndm_state: u16,
+    ndm_flags: u8,
+    ndm_type: u8,
+}
+
+// Neighbor states
+const NUD_INCOMPLETE: u16 = 0x01;
+const NUD_REACHABLE: u16 = 0x02;
+const NUD_STALE: u16 = 0x04;
+const NUD_DELAY: u16 = 0x08;
+const NUD_PROBE: u16 = 0x10;
+const NUD_FAILED: u16 = 0x20;
+const NUD_NOARP: u16 = 0x40;
+const NUD_PERMANENT: u16 = 0x80;
 
 // Make this public so other modules (like ifconfig) can use it
 pub fn add_route_internal_v4(
@@ -1270,6 +1340,526 @@ fn del_address_internal_v6(addr: Ipv6Addr, prefix: u8, device: &str) -> Result<(
 
     unsafe { libc::close(sock); }
     Ok(())
+}
+
+// Neighbor manipulation functions
+
+struct NeighborInfo {
+    ip: String,
+    mac: String,
+    state: u16,
+    ifindex: i32,
+}
+
+fn show_neighbors(_is_ipv6: bool, device: Option<&str>) {
+    let filter_if_index = device.and_then(|dev| get_interface_index(dev));
+
+    let sock = match create_netlink_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create netlink socket: {}", e);
+            return;
+        }
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: (std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ndmsg>()) as u32,
+        nlmsg_type: RTM_GETNEIGH,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ndm = ndmsg {
+        ndm_family: libc::AF_UNSPEC as u8,
+        ndm_pad1: 0,
+        ndm_pad2: 0,
+        ndm_ifindex: 0,
+        ndm_state: 0,
+        ndm_flags: 0,
+        ndm_type: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ndm as *const ndmsg as *const u8,
+            std::mem::size_of::<ndmsg>(),
+        )
+    });
+
+    if let Err(e) = send_netlink_message(sock, &msg) {
+        eprintln!("Failed to send netlink message: {}", e);
+        unsafe { libc::close(sock); }
+        return;
+    }
+
+    let mut neighbors: Vec<NeighborInfo> = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let mut done = false;
+
+    while !done {
+        let len = unsafe {
+            libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+        };
+
+        if len <= 0 {
+            break;
+        }
+
+        let mut offset = 0;
+        while offset + std::mem::size_of::<nlmsghdr>() <= len as usize {
+            let nlh = unsafe { &*(buf.as_ptr().add(offset) as *const nlmsghdr) };
+
+            if nlh.nlmsg_type == NLMSG_DONE {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == NLMSG_ERROR {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == RTM_NEWNEIGH {
+                let ndm = unsafe {
+                    &*(buf.as_ptr().add(offset + std::mem::size_of::<nlmsghdr>()) as *const ndmsg)
+                };
+
+                if let Some(filter_idx) = filter_if_index {
+                    if ndm.ndm_ifindex != filter_idx {
+                        offset += nlh.nlmsg_len as usize;
+                        continue;
+                    }
+                }
+
+                let attr_offset = offset + std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ndmsg>();
+                let attr_len = nlh.nlmsg_len as usize - std::mem::size_of::<nlmsghdr>() - std::mem::size_of::<ndmsg>();
+
+                let mut ip_str = String::new();
+                let mut mac_str = String::new();
+
+                parse_neighbor_attributes(&buf[attr_offset..attr_offset + attr_len], ndm.ndm_family, &mut ip_str, &mut mac_str);
+
+                if !ip_str.is_empty() {
+                    neighbors.push(NeighborInfo {
+                        ip: ip_str,
+                        mac: mac_str,
+                        state: ndm.ndm_state,
+                        ifindex: ndm.ndm_ifindex,
+                    });
+                }
+            }
+
+            offset += nlh.nlmsg_len as usize;
+        }
+    }
+
+    unsafe { libc::close(sock); }
+
+    for neigh in neighbors {
+        let if_name = get_interface_name(neigh.ifindex).unwrap_or_else(|| format!("if{}", neigh.ifindex));
+        let state_str = neighbor_state_to_string(neigh.state);
+        if !neigh.mac.is_empty() {
+            println!("{} dev {} lladdr {} {}", neigh.ip, if_name, neigh.mac, state_str);
+        } else {
+            println!("{} dev {} {}", neigh.ip, if_name, state_str);
+        }
+    }
+}
+
+fn parse_neighbor_attributes(data: &[u8], family: u8, ip_str: &mut String, mac_str: &mut String) {
+    let mut offset = 0;
+
+    while offset + std::mem::size_of::<rtattr>() <= data.len() {
+        let rta = unsafe { &*(data.as_ptr().add(offset) as *const rtattr) };
+
+        if rta.rta_len < std::mem::size_of::<rtattr>() as u16 {
+            break;
+        }
+
+        let payload_offset = offset + std::mem::size_of::<rtattr>();
+        let payload_len = rta.rta_len as usize - std::mem::size_of::<rtattr>();
+
+        if payload_offset + payload_len > data.len() {
+            break;
+        }
+
+        match rta.rta_type {
+            NDA_DST => {
+                if family == libc::AF_INET as u8 && payload_len == 4 {
+                    let octets: [u8; 4] = data[payload_offset..payload_offset + 4].try_into().unwrap();
+                    *ip_str = Ipv4Addr::from(octets).to_string();
+                } else if family == libc::AF_INET6 as u8 && payload_len == 16 {
+                    let octets: [u8; 16] = data[payload_offset..payload_offset + 16].try_into().unwrap();
+                    *ip_str = Ipv6Addr::from(octets).to_string();
+                }
+            }
+            NDA_LLADDR => {
+                if payload_len == 6 {
+                    let mac: [u8; 6] = data[payload_offset..payload_offset + 6].try_into().unwrap();
+                    *mac_str = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                }
+            }
+            _ => {}
+        }
+
+        let aligned_len = (rta.rta_len as usize + 3) & !3;
+        offset += aligned_len;
+    }
+}
+
+fn neighbor_state_to_string(state: u16) -> &'static str {
+    if state & NUD_PERMANENT != 0 {
+        "PERMANENT"
+    } else if state & NUD_REACHABLE != 0 {
+        "REACHABLE"
+    } else if state & NUD_STALE != 0 {
+        "STALE"
+    } else if state & NUD_DELAY != 0 {
+        "DELAY"
+    } else if state & NUD_PROBE != 0 {
+        "PROBE"
+    } else if state & NUD_FAILED != 0 {
+        "FAILED"
+    } else if state & NUD_INCOMPLETE != 0 {
+        "INCOMPLETE"
+    } else if state & NUD_NOARP != 0 {
+        "NOARP"
+    } else {
+        ""
+    }
+}
+
+fn add_neighbor(args: &[&str]) {
+    // Format: <ip> lladdr <mac> dev <interface> [nud <state>]
+    if args.len() < 5 {
+        eprintln!("Usage: ip neigh add <ip> lladdr <mac> dev <interface>");
+        return;
+    }
+
+    let ip_str = args[0];
+    if args[1] != "lladdr" {
+        eprintln!("Expected 'lladdr' after IP address");
+        return;
+    }
+    let mac_str = args[2];
+    if args[3] != "dev" {
+        eprintln!("Expected 'dev' after MAC address");
+        return;
+    }
+    let device = args[4];
+
+    // Parse IP address to determine family
+    let (family, ip_bytes): (u8, Vec<u8>) = if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
+        (libc::AF_INET as u8, ipv4.octets().to_vec())
+    } else if let Ok(ipv6) = ip_str.parse::<Ipv6Addr>() {
+        (libc::AF_INET6 as u8, ipv6.octets().to_vec())
+    } else {
+        eprintln!("Invalid IP address: {}", ip_str);
+        return;
+    };
+
+    // Parse MAC address
+    let mac_parts: Vec<&str> = mac_str.split(':').collect();
+    if mac_parts.len() != 6 {
+        eprintln!("Invalid MAC address format: {}", mac_str);
+        return;
+    }
+    let mut mac_bytes = [0u8; 6];
+    for (i, part) in mac_parts.iter().enumerate() {
+        mac_bytes[i] = match u8::from_str_radix(part, 16) {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("Invalid MAC address: {}", mac_str);
+                return;
+            }
+        };
+    }
+
+    if let Err(e) = add_neighbor_internal(ip_bytes, mac_bytes, family, device) {
+        eprintln!("Failed to add neighbor: {}", e);
+    } else {
+        println!("Neighbor added successfully");
+    }
+}
+
+fn add_neighbor_internal(ip: Vec<u8>, mac: [u8; 6], family: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_NEWNEIGH,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ndm = ndmsg {
+        ndm_family: family,
+        ndm_pad1: 0,
+        ndm_pad2: 0,
+        ndm_ifindex: if_index,
+        ndm_state: NUD_PERMANENT,
+        ndm_flags: 0,
+        ndm_type: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ndm as *const ndmsg as *const u8,
+            std::mem::size_of::<ndmsg>(),
+        )
+    });
+
+    add_rta_attr(&mut msg, NDA_DST, &ip);
+    add_rta_attr(&mut msg, NDA_LLADDR, &mac);
+
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    send_netlink_message(sock, &msg)?;
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
+fn del_neighbor(args: &[&str]) {
+    // Format: <ip> dev <interface>
+    if args.len() < 3 || args[1] != "dev" {
+        eprintln!("Usage: ip neigh del <ip> dev <interface>");
+        return;
+    }
+
+    let ip_str = args[0];
+    let device = args[2];
+
+    // Parse IP address to determine family
+    let (family, ip_bytes): (u8, Vec<u8>) = if let Ok(ipv4) = ip_str.parse::<Ipv4Addr>() {
+        (libc::AF_INET as u8, ipv4.octets().to_vec())
+    } else if let Ok(ipv6) = ip_str.parse::<Ipv6Addr>() {
+        (libc::AF_INET6 as u8, ipv6.octets().to_vec())
+    } else {
+        eprintln!("Invalid IP address: {}", ip_str);
+        return;
+    };
+
+    if let Err(e) = del_neighbor_internal(ip_bytes, family, device) {
+        eprintln!("Failed to delete neighbor: {}", e);
+    } else {
+        println!("Neighbor deleted successfully");
+    }
+}
+
+fn del_neighbor_internal(ip: Vec<u8>, family: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_DELNEIGH,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ndm = ndmsg {
+        ndm_family: family,
+        ndm_pad1: 0,
+        ndm_pad2: 0,
+        ndm_ifindex: if_index,
+        ndm_state: 0,
+        ndm_flags: 0,
+        ndm_type: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ndm as *const ndmsg as *const u8,
+            std::mem::size_of::<ndmsg>(),
+        )
+    });
+
+    add_rta_attr(&mut msg, NDA_DST, &ip);
+
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    send_netlink_message(sock, &msg)?;
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
+fn flush_neighbors(args: &[&str]) {
+    // Format: dev <interface>
+    if args.len() < 2 || args[0] != "dev" {
+        eprintln!("Usage: ip neigh flush dev <interface>");
+        return;
+    }
+
+    let device = args[1];
+    let filter_if_index = match get_interface_index(device) {
+        Some(idx) => idx,
+        None => {
+            eprintln!("Interface {} not found", device);
+            return;
+        }
+    };
+
+    // First, get all neighbors for the interface
+    let sock = match create_netlink_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create netlink socket: {}", e);
+            return;
+        }
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: (std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ndmsg>()) as u32,
+        nlmsg_type: RTM_GETNEIGH,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ndm = ndmsg {
+        ndm_family: libc::AF_UNSPEC as u8,
+        ndm_pad1: 0,
+        ndm_pad2: 0,
+        ndm_ifindex: 0,
+        ndm_state: 0,
+        ndm_flags: 0,
+        ndm_type: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ndm as *const ndmsg as *const u8,
+            std::mem::size_of::<ndmsg>(),
+        )
+    });
+
+    if let Err(e) = send_netlink_message(sock, &msg) {
+        eprintln!("Failed to send netlink message: {}", e);
+        unsafe { libc::close(sock); }
+        return;
+    }
+
+    let mut neighbors_to_delete: Vec<(Vec<u8>, u8)> = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let mut done = false;
+
+    while !done {
+        let len = unsafe {
+            libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+        };
+
+        if len <= 0 {
+            break;
+        }
+
+        let mut offset = 0;
+        while offset + std::mem::size_of::<nlmsghdr>() <= len as usize {
+            let nlh = unsafe { &*(buf.as_ptr().add(offset) as *const nlmsghdr) };
+
+            if nlh.nlmsg_type == NLMSG_DONE {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == NLMSG_ERROR {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == RTM_NEWNEIGH {
+                let ndm = unsafe {
+                    &*(buf.as_ptr().add(offset + std::mem::size_of::<nlmsghdr>()) as *const ndmsg)
+                };
+
+                if ndm.ndm_ifindex == filter_if_index {
+                    let attr_offset = offset + std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ndmsg>();
+                    let attr_len = nlh.nlmsg_len as usize - std::mem::size_of::<nlmsghdr>() - std::mem::size_of::<ndmsg>();
+
+                    let mut ip_str = String::new();
+                    let mut mac_str = String::new();
+                    parse_neighbor_attributes(&buf[attr_offset..attr_offset + attr_len], ndm.ndm_family, &mut ip_str, &mut mac_str);
+
+                    if !ip_str.is_empty() {
+                        // Store the IP bytes and family for deletion
+                        let ip_bytes = if ndm.ndm_family == libc::AF_INET as u8 {
+                            ip_str.parse::<Ipv4Addr>().ok().map(|ip| ip.octets().to_vec())
+                        } else {
+                            ip_str.parse::<Ipv6Addr>().ok().map(|ip| ip.octets().to_vec())
+                        };
+
+                        if let Some(bytes) = ip_bytes {
+                            neighbors_to_delete.push((bytes, ndm.ndm_family));
+                        }
+                    }
+                }
+            }
+
+            offset += nlh.nlmsg_len as usize;
+        }
+    }
+
+    unsafe { libc::close(sock); }
+
+    // Now delete all collected neighbors
+    let mut deleted_count = 0;
+    for (ip_bytes, family) in neighbors_to_delete {
+        if del_neighbor_internal(ip_bytes, family, device).is_ok() {
+            deleted_count += 1;
+        }
+    }
+
+    println!("Flushed {} neighbor entries from {}", deleted_count, device);
 }
 
 // Netlink helper functions
