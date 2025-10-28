@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use oside::protocols::icmpv6::icmpv6NeighborSolicitation;
 
 // Global state for fake hosts
 lazy_static::lazy_static! {
@@ -23,11 +24,10 @@ pub fn main(args: &str) {
 
     if parts.is_empty() {
         eprintln!("Usage:");
-        eprintln!("  fakehost add <interface> <ipv4-address>  - Add fake host responding to ARP");
-        eprintln!("  fakehost del <interface> <ipv4-address>  - Remove fake host");
+        eprintln!("  fakehost add <interface> <ip-address>  - Add fake host responding to ARP/NS");
+        eprintln!("  fakehost del <interface> <ip-address>  - Remove fake host");
         eprintln!("  fakehost show                            - Show all fake hosts");
         eprintln!("");
-        eprintln!("Note: Only IPv4/ARP is currently supported. IPv6/NDP support coming soon.");
         return;
     }
 
@@ -114,9 +114,18 @@ fn add_fakehost(iface: &str, ip: &str) {
             eprintln!("Invalid IPv4 address: {}", ip);
         }
     } else {
-        // IPv6 not yet supported
-        eprintln!("IPv6 NDP support not yet implemented. Only IPv4 ARP is currently supported.");
-        eprintln!("Try adding an IPv4 address instead.");
+        if is_ipv6 {
+            if let Ok(ipv6) = ip.parse::<Ipv6Addr>() {
+                if !interface.ipv6_addrs.contains(&ipv6) {
+                    interface.ipv6_addrs.push(ipv6);
+                    println!("Added fake host {} on {} (will respond to NS)", ip, iface);
+                } else {
+                    eprintln!("Fake host {} already exists on {}", ip, iface);
+                }
+            } else {
+                eprintln!("Invalid IPv6 address: {}", ip);
+            }
+        }
     }
 }
 
@@ -294,6 +303,7 @@ fn responder_thread(iface: &str, stop_flag: Arc<AtomicBool>) {
     println!("Fake host responder stopped on {}", iface);
 }
 
+
 fn process_packet(packet: &[u8], iface: &str) -> Option<Vec<u8>> {
     use oside::protocols::all::*;
     use oside::*;
@@ -302,23 +312,26 @@ fn process_packet(packet: &[u8], iface: &str) -> Option<Vec<u8>> {
     let (stack, _) = Ether!().ldecode(packet)?;
 
     // Check if it's ARP
-    for layer in &stack.layers {
-        let type_name = layer.typetag_name();
-
-        if type_name == "arp" {
-            return handle_arp(layer, iface);
-        }
-        // TODO: Add IPv6 NDP support later
+    if let Some(arp) = stack.get_layer(ARP!()) {
+       return handle_arp(arp, iface);
+    }
+    if let Some(arp) = stack.get_layer(Icmpv6NeighborSolicitation!()) {
+       return handle_ns(&stack, iface);
     }
 
     None
 }
 
-fn handle_arp(arp_layer: &Box<dyn oside::Layer>, iface: &str) -> Option<Vec<u8>> {
+use oside::protocols::all::Arp;
+
+fn handle_arp(arp: &Arp, iface: &str) -> Option<Vec<u8>> {
     use oside::protocols::all::*;
     use oside::*;
 
-    let json = serde_json::to_value(arp_layer).ok()?;
+    // FIXME: This is ... interesting, to say the least.
+    // Does this mean I need better ergonomics for the oside,
+    // such that Claude could figure it out ?
+    let json = serde_json::to_value(arp).ok()?;
 
     // Check if it's an ARP request
     let op = json.get("op")?.as_u64()?;
@@ -369,10 +382,37 @@ fn handle_arp(arp_layer: &Box<dyn oside::Layer>, iface: &str) -> Option<Vec<u8>>
     Some(stack.lencode())
 }
 
-// TODO: IPv6 NDP support - disabled for now
-// fn handle_ipv6_ndp(stack: &oside::LayerStack, iface: &str) -> Option<Vec<u8>> {
-//     ...
-// }
+fn handle_ns(stack: &oside::LayerStack, iface: &str) -> Option<Vec<u8>> {
+    use oside::*;
+    use oside::protocols::all::*;
+    use oside::Icmpv6NeighborSolicitation;
+    use oside::protocols::icmpv6::icmpv6NeighborAdvertisement;
+    use oside::protocols::icmpv6::Icmpv6;
+    use oside::protocols::icmpv6::NdpOption::SourceLinkLayerAddress;
+
+    let rx_ns = &stack[Icmpv6NeighborSolicitation!()];
+
+    let target_ip: Ipv6Addr = rx_ns.target_address.value().into();
+
+    // Check if we should respond to this IP
+    let hosts = FAKE_HOSTS.lock().unwrap();
+    let interface = hosts.get(iface)?;
+
+    if !interface.ipv6_addrs.contains(&target_ip) {
+        return None;
+    }
+    let fake_mac = "00:11:22:33:44:55";
+    let fake_ll_ip6 = "fe80::2";
+    let pkt = Ether!(dst = stack[Ether!()].src.clone(), src = fake_mac) // interface.mac_addr)
+            / IPV6!(hop_limit = 255, src = fake_ll_ip6, dst = stack[IPV6!()].src.value().clone())
+            / ICMPV6!()
+            / Icmpv6NeighborAdvertisement!(target_address = rx_ns.target_address.value().clone(),
+               flags = 0xe0000000,
+               options = vec![SourceLinkLayerAddress(fake_mac.into())]
+              );
+
+    Some(pkt.lencode())
+}
 
 pub fn help_text() -> &'static str {
     "fakehost <add|del|show>           - Manage fake hosts responding to ARP (IPv4 only)"
