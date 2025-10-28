@@ -6,8 +6,8 @@ pub fn main(args: &str) {
     let parts: Vec<&str> = args.trim().split_whitespace().collect();
 
     if parts.len() != 2 {
-        eprintln!("Usage: pcap2json <input.pcap> <output.json>");
-        eprintln!("  Converts PCAP file to JSON format");
+        eprintln!("Usage: pcap2json <input.pcap> <output.jsonl>");
+        eprintln!("  Converts PCAP file to JSONL format (oside layers with timestamps)");
         return;
     }
 
@@ -40,8 +40,9 @@ pub fn main(args: &str) {
         }
     };
 
-    // Convert packets to JSON
-    let mut json_packets = Vec::new();
+    // Convert packets to JSONL format (one JSON object per line)
+    let mut jsonl_lines = Vec::new();
+    let mut packet_count = 0;
 
     for p in &pcap.d.packets {
         let pkt = match pcap.d.network.value() {
@@ -58,25 +59,38 @@ pub fn main(args: &str) {
                 }
             }
         };
-        json_packets.push(pkt.layers);
+
+        // Calculate timestamp in microseconds
+        let timestamp_us = (p.ts_sec.value() as u128) * 1_000_000 + (p.ts_usec.value() as u128);
+
+        // Create JSONL entry with timestamp_us, direction, and layers
+        let entry = serde_json::json!({
+            "timestamp_us": timestamp_us,
+            "direction": "rx",  // PCAP doesn't have direction info, default to rx
+            "layers": pkt.layers
+        });
+
+        match serde_json::to_string(&entry) {
+            Ok(line) => jsonl_lines.push(line),
+            Err(e) => {
+                eprintln!("Error serializing packet {}: {}", packet_count, e);
+                continue;
+            }
+        }
+
+        packet_count += 1;
     }
 
-    // Write JSON output
-    let json_str = match serde_json::to_string_pretty(&json_packets) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error serializing to JSON: {}", e);
-            return;
-        }
-    };
+    // Write JSONL output (one JSON object per line)
+    let jsonl_str = jsonl_lines.join("\n") + "\n";
 
-    if let Err(e) = std::fs::write(output_file, json_str) {
+    if let Err(e) = std::fs::write(output_file, jsonl_str) {
         eprintln!("Error writing to {}: {}", output_file, e);
         return;
     }
 
     println!("Converted {} packets from {} to {}",
-             json_packets.len(), input_file, output_file);
+             packet_count, input_file, output_file);
 }
 
 fn read_file(filename: &str) -> Result<Vec<u8>, String> {
@@ -97,5 +111,5 @@ fn read_file(filename: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn help_text() -> &'static str {
-    "pcap2json <in.pcap> <out.json>   - Convert PCAP to JSON format"
+    "pcap2json <in.pcap> <out.jsonl>  - Convert PCAP to JSONL format (oside layers)"
 }
