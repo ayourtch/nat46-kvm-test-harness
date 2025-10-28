@@ -487,26 +487,214 @@ Uses `AF_PACKET` raw sockets:
 
 ### oside Integration
 
-The oside library provides:
-- Layer trait for all protocol types
-- LayerStack for composing packets
-- Encoders/decoders for each protocol
-- Automatic field calculation (fill() method)
-- Serialization/deserialization support
+The oside library provides a powerful packet manipulation framework with protocol-aware layer composition.
 
-**Usage pattern:**
+**Core Concepts:**
+- `Layer` trait: All protocol types implement this
+- `LayerStack`: Container for composed protocol layers
+- Protocol macros: `Ether!()`, `IP!()`, `ARP!()`, `ICMP!()`, etc.
+- Encoders/decoders: `ldecode()` for parsing, `lencode()` for serialization
+- Automatic field calculation: checksums, lengths, etc.
+
+#### Basic Usage Patterns
+
+**1. Parsing Packets:**
 ```rust
-// Parsing
+use oside::protocols::all::*;
+use oside::*;
+
+// Decode from bytes
 let (stack, _) = Ether!().ldecode(packet)?;
 
-// Construction
-let packet = Ether!(dst = "ff:ff:ff:ff:ff:ff", src = "...", etype = 0x0806)
-           / ARP!(op = 1, ...);
-let bytes = packet.lencode();
+// Check if layer exists
+if let Some(arp) = stack.get_layer(ARP!()) {
+    // Process ARP layer
+}
 
-// Auto-fill checksums
+// Or use pattern for layers that must exist
+if stack.get_layer(Icmpv6NeighborSolicitation!()).is_some() {
+    // Process NS
+}
+```
+
+**2. Accessing Layer Data:**
+```rust
+// Extract layer from stack - use the typed reference
+let ip_layer = &stack[IP!()];
+let eth_layer = &stack[Ether!()];
+
+// Access field values - ALWAYS use .value()
+let src_ip: Ipv4Addr = ip_layer.src.value().into();
+let dst_mac = eth_layer.dst.clone();
+
+// For string conversion
+let ip_str = ip_layer.src.value().to_string();
+
+// IMPORTANT: Use direct field access, NOT JSON serialization
+// Each protocol struct has strongly-typed fields accessible directly
+```
+
+**3. Building Packets (Layer Composition):**
+```rust
+// Use / operator to chain layers
+let packet = Ether!(
+    dst = "ff:ff:ff:ff:ff:ff",
+    src = "00:11:22:33:44:55",
+    etype = 0x0806
+) / ARP!(
+    op = 2,
+    hwsrc = ArpHardwareAddress::from("00:11:22:33:44:55"),
+    psrc = ArpProtocolAddress::from("192.168.1.1")
+);
+
+// Encode to bytes
+let bytes = packet.lencode();
+```
+
+**4. ICMP/ICMPv6 Packet Structure:**
+
+ICMP packets have multiple layers:
+- Header layer: `ICMP!()` or `ICMPV6!()`
+- Message type layers: `Echo!()`, `EchoReply!()`, etc.
+- Data layer: `Raw!()`
+
+```rust
+// ICMP Echo Request parsing
+let icmp_layer = &stack[ICMP!()];
+let echo_layer = &stack[Echo!()];
+let data_layer = &stack[Raw!()];
+
+// Check ICMP type - use direct field access
+let icmp_type = icmp_layer.typ.value();  // 8 = Echo Request
+
+// Build ICMP Echo Reply
+let reply = Ether!(...)
+    / IP!(...)
+    / ICMP!()
+    / EchoReply!(
+        identifier = echo_layer.identifier.value().clone(),
+        sequence = echo_layer.sequence.value().clone()
+    )
+    / data_layer.clone();  // Preserve original data
+```
+
+**5. ICMPv6 Neighbor Discovery:**
+
+```rust
+use oside::protocols::icmpv6::*;
+
+// Neighbor Solicitation parsing
+let ns = &stack[Icmpv6NeighborSolicitation!()];
+let target_ip: Ipv6Addr = ns.target_address.value().into();
+
+// Neighbor Advertisement reply
+let reply = Ether!(...)
+    / IPV6!(hop_limit = 255, ...)
+    / ICMPV6!()
+    / Icmpv6NeighborAdvertisement!(
+        target_address = ns.target_address.value().clone(),
+        flags = 0x60000000,  // Solicited + Override
+        options = vec![TargetLinkLayerAddress("00:11:22:33:44:55".into())]
+    );
+```
+
+#### Important API Patterns
+
+**Field Access (The Correct Way):**
+- **ALWAYS** use `.value()` to get field contents
+- Use `.clone()` when reusing field values in new packets
+- Convert to standard types with `.into()` or `.to_string()`
+- Access fields directly on typed structs - each protocol has its own struct with named fields
+- **NEVER** use JSON serialization as an intermediate step
+
+**Type Conversions:**
+```rust
+// oside -> std types
+let ipv4: Ipv4Addr = oside_ipv4.into();
+let ipv6: Ipv6Addr = oside_ipv6.into();
+
+// String conversions
+let ip_str = oside_ip.to_string();
+let mac_str = "00:11:22:33:44:55";
+```
+
+**Layer Composition Rules:**
+- Use `/` operator between layers
+- Result is a `LayerStack`, not individual layers
+- Call `.lencode()` on final stack to get bytes
+- Order matters: Ether / IP / TCP (outer to inner)
+
+**Auto-Fill Checksums:**
+```rust
+// Method 1: Encode then decode (forces recalculation)
+let encoded = stack.lencode();
+let (decoded, _) = Ether!().ldecode(&encoded)?;
+// Now checksums are correct
+
+// Method 2: Use filled=false (during construction)
 let stack = LayerStack { filled: false, layers };
-let filled = stack.fill();
+let bytes = stack.lencode();  // Checksums calculated during encoding
+```
+
+#### Common Patterns from fakehost.rs
+
+**ARP Reply:**
+```rust
+let arp_reply = ARP!(
+    op = 2,  // Reply
+    hwsrc = ArpHardwareAddress::from(mac_str.as_str()),
+    psrc = ArpProtocolAddress::from(ip_str),
+    hwdst = ArpHardwareAddress::from(sender_mac),
+    pdst = ArpProtocolAddress::from(sender_ip)
+);
+
+let packet = Ether!(...) / arp_reply;
+```
+
+**IPv6 Neighbor Advertisement:**
+```rust
+let na = Icmpv6NeighborAdvertisement!(
+    target_address = target_addr.clone(),
+    flags = 0x60000000,  // S+O flags
+    options = vec![TargetLinkLayerAddress(mac.into())]
+);
+
+let packet = Ether!(...) / IPV6!(hop_limit = 255, ...) / ICMPV6!() / na;
+```
+
+**ICMP Echo Reply:**
+```rust
+let reply = Ether!(...)
+    / IP!(...)
+    / ICMP!()
+    / EchoReply!(
+        identifier = request.identifier.value().clone(),
+        sequence = request.sequence.value().clone()
+    )
+    / original_data.clone();
+```
+
+#### Key Lessons Learned
+
+**Working with Protocol Fields:**
+1. Extract the typed layer: `let icmp = &stack[ICMP!()];`
+2. Access fields directly: `icmp.typ.value()`
+3. Use the strongly-typed API - don't resort to JSON
+
+**Layer Detection:**
+```rust
+// Check if layer exists before accessing
+if stack.get_layer(IP!()).is_some() {
+    let ip = &stack[IP!()];  // Safe now
+}
+```
+
+**Import Organization:**
+```rust
+use oside::*;
+use oside::protocols::all::*;
+// For specific ICMPv6 types:
+use oside::protocols::icmpv6::*;
 ```
 
 ### Kernel Tracing Infrastructure
