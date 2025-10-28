@@ -455,7 +455,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "oside"
 version = "0.1.0"
-source = "git+https://github.com/ayourtch/oside#9511d7daa30c0bef3c86ab364aca1b3cc15995dd"
+source = "git+https://github.com/ayourtch/oside#4c880f97455331c014c0560f1bd8b16c95ee4760"
 dependencies = [
  "aes",
  "cbc",
@@ -484,7 +484,7 @@ dependencies = [
 [[package]]
 name = "oside-derive"
 version = "0.1.0"
-source = "git+https://github.com/ayourtch/oside#9511d7daa30c0bef3c86ab364aca1b3cc15995dd"
+source = "git+https://github.com/ayourtch/oside#4c880f97455331c014c0560f1bd8b16c95ee4760"
 dependencies = [
  "proc-macro2",
  "quote",
