@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::collections::HashMap;
 
 pub fn main(args: &str) {
     let parts: Vec<&str> = args.trim().split_whitespace().collect();
@@ -63,6 +64,48 @@ pub fn main(args: &str) {
                 }
             }
         }
+        "addr" | "address" => {
+            if parts.len() <= args_offset + 1 {
+                // Default to "show"
+                show_addresses(is_ipv6, None);
+            } else {
+                match parts[args_offset + 1] {
+                    "show" | "list" => {
+                        // Check for "dev <interface>" argument
+                        let device = if parts.len() > args_offset + 2 && parts[args_offset + 2] == "dev" {
+                            if parts.len() > args_offset + 3 {
+                                Some(parts[args_offset + 3])
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        show_addresses(is_ipv6, device);
+                    }
+                    "add" => {
+                        let addr_args = &parts[args_offset + 2..];
+                        if is_ipv6 {
+                            add_address_v6(addr_args);
+                        } else {
+                            add_address_v4(addr_args);
+                        }
+                    }
+                    "del" | "delete" => {
+                        let addr_args = &parts[args_offset + 2..];
+                        if is_ipv6 {
+                            del_address_v6(addr_args);
+                        } else {
+                            del_address_v4(addr_args);
+                        }
+                    }
+                    _ => {
+                        eprintln!("Unknown address command: {}", parts[args_offset + 1]);
+                        print_usage();
+                    }
+                }
+            }
+        }
         _ => {
             eprintln!("Unknown ip command: {}", parts[args_offset]);
             print_usage();
@@ -72,12 +115,19 @@ pub fn main(args: &str) {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  ip route [show]                              - Show IPv4 routes");
-    eprintln!("  ip route add <dest> via <gateway> [dev <if>] - Add IPv4 route");
-    eprintln!("  ip route del <dest>                          - Delete IPv4 route");
-    eprintln!("  ip -6 route [show]                           - Show IPv6 routes");
-    eprintln!("  ip -6 route add <dest> via <gateway> [dev <if>] - Add IPv6 route");
-    eprintln!("  ip -6 route del <dest>                       - Delete IPv6 route");
+    eprintln!("  Routes:");
+    eprintln!("    ip route [show]                              - Show IPv4 routes");
+    eprintln!("    ip route add <dest> via <gateway> [dev <if>] - Add IPv4 route");
+    eprintln!("    ip route del <dest>                          - Delete IPv4 route");
+    eprintln!("    ip -6 route [show]                           - Show IPv6 routes");
+    eprintln!("    ip -6 route add <dest> via <gateway> [dev <if>] - Add IPv6 route");
+    eprintln!("    ip -6 route del <dest>                       - Delete IPv6 route");
+    eprintln!("  Addresses:");
+    eprintln!("    ip addr [show] [dev <if>]                    - Show addresses");
+    eprintln!("    ip addr add <addr/prefix> dev <if>           - Add IPv4 address");
+    eprintln!("    ip addr del <addr/prefix> dev <if>           - Delete IPv4 address");
+    eprintln!("    ip -6 addr add <addr/prefix> dev <if>        - Add IPv6 address");
+    eprintln!("    ip -6 addr del <addr/prefix> dev <if>        - Delete IPv6 address");
 }
 
 fn show_ipv4_routes() {
@@ -387,14 +437,24 @@ fn parse_cidr_v6(cidr: &str) -> (Ipv6Addr, u8) {
 const NETLINK_ROUTE: i32 = 0;
 const RTM_NEWROUTE: u16 = 24;
 const RTM_DELROUTE: u16 = 25;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+const RTM_GETADDR: u16 = 22;
 const NLM_F_REQUEST: u16 = 1;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_EXCL: u16 = 0x200;
+const NLM_F_DUMP: u16 = 0x300;
 
 const RTA_DST: u16 = 1;
 const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
+
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
 
 const RTN_UNICAST: u8 = 1;
 const RT_SCOPE_UNIVERSE: u8 = 0;
@@ -428,6 +488,15 @@ struct rtmsg {
 struct rtattr {
     rta_len: u16,
     rta_type: u16,
+}
+
+#[repr(C)]
+struct ifaddrmsg {
+    ifa_family: u8,
+    ifa_prefixlen: u8,
+    ifa_flags: u8,
+    ifa_scope: u8,
+    ifa_index: u32,
 }
 
 // Make this public so other modules (like ifconfig) can use it
@@ -724,6 +793,485 @@ fn del_ipv6_route_internal(dest: Ipv6Addr, prefix: u8) -> Result<(), String> {
     Ok(())
 }
 
+// Address manipulation functions
+
+struct AddressInfo {
+    family: u8,
+    addr: String,
+    prefix: u8,
+}
+
+fn show_addresses(_is_ipv6: bool, device: Option<&str>) {
+    let filter_if_index = device.and_then(|dev| get_interface_index(dev));
+
+    // Create netlink socket
+    let sock = match create_netlink_socket() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to create netlink socket: {}", e);
+            return;
+        }
+    };
+
+    // Build RTM_GETADDR request
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: (std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ifaddrmsg>()) as u32,
+        nlmsg_type: RTM_GETADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ifa = ifaddrmsg {
+        ifa_family: libc::AF_UNSPEC as u8,
+        ifa_prefixlen: 0,
+        ifa_flags: 0,
+        ifa_scope: 0,
+        ifa_index: 0,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ifa as *const ifaddrmsg as *const u8,
+            std::mem::size_of::<ifaddrmsg>(),
+        )
+    });
+
+    // Send message
+    if let Err(e) = send_netlink_message(sock, &msg) {
+        eprintln!("Failed to send netlink message: {}", e);
+        unsafe { libc::close(sock); }
+        return;
+    }
+
+    // Collect all addresses grouped by interface
+    let mut interfaces: HashMap<u32, Vec<AddressInfo>> = HashMap::new();
+    let mut buf = vec![0u8; 8192];
+    let mut done = false;
+
+    while !done {
+        let len = unsafe {
+            libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+        };
+
+        if len <= 0 {
+            break;
+        }
+
+        let mut offset = 0;
+        while offset + std::mem::size_of::<nlmsghdr>() <= len as usize {
+            let nlh = unsafe { &*(buf.as_ptr().add(offset) as *const nlmsghdr) };
+
+            if nlh.nlmsg_type == NLMSG_DONE {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == NLMSG_ERROR {
+                done = true;
+                break;
+            }
+
+            if nlh.nlmsg_type == RTM_NEWADDR {
+                let ifa = unsafe {
+                    &*(buf.as_ptr().add(offset + std::mem::size_of::<nlmsghdr>()) as *const ifaddrmsg)
+                };
+
+                // Skip if filtering by device and doesn't match
+                if let Some(filter_idx) = filter_if_index {
+                    if ifa.ifa_index != filter_idx as u32 {
+                        offset += nlh.nlmsg_len as usize;
+                        continue;
+                    }
+                }
+
+                // Parse attributes
+                let attr_offset = offset + std::mem::size_of::<nlmsghdr>() + std::mem::size_of::<ifaddrmsg>();
+                let attr_len = nlh.nlmsg_len as usize - std::mem::size_of::<nlmsghdr>() - std::mem::size_of::<ifaddrmsg>();
+
+                let mut addr_str = String::new();
+                let mut local_str = String::new();
+
+                parse_address_attributes(&buf[attr_offset..attr_offset + attr_len], ifa.ifa_family, &mut addr_str, &mut local_str);
+
+                // For IPv4, prefer IFA_LOCAL, for IPv6 use IFA_ADDRESS
+                let display_addr = if ifa.ifa_family == libc::AF_INET as u8 {
+                    if !local_str.is_empty() { local_str } else { addr_str }
+                } else {
+                    addr_str
+                };
+
+                if !display_addr.is_empty() {
+                    interfaces.entry(ifa.ifa_index).or_insert_with(Vec::new).push(AddressInfo {
+                        family: ifa.ifa_family,
+                        addr: display_addr,
+                        prefix: ifa.ifa_prefixlen,
+                    });
+                }
+            }
+
+            offset += nlh.nlmsg_len as usize;
+        }
+    }
+
+    unsafe { libc::close(sock); }
+
+    // Sort interfaces by index and display
+    let mut if_indices: Vec<u32> = interfaces.keys().copied().collect();
+    if_indices.sort();
+
+    for if_index in if_indices {
+        let if_name = get_interface_name(if_index as i32).unwrap_or_else(|| format!("if{}", if_index));
+        println!("{}:", if_name);
+
+        if let Some(addrs) = interfaces.get(&if_index) {
+            for addr_info in addrs {
+                let family = if addr_info.family == libc::AF_INET as u8 { "inet" } else { "inet6" };
+                println!("    {} {}/{}", family, addr_info.addr, addr_info.prefix);
+            }
+        }
+    }
+}
+
+fn parse_address_attributes(data: &[u8], family: u8, addr_str: &mut String, local_str: &mut String) {
+    let mut offset = 0;
+
+    while offset + std::mem::size_of::<rtattr>() <= data.len() {
+        let rta = unsafe { &*(data.as_ptr().add(offset) as *const rtattr) };
+
+        if rta.rta_len < std::mem::size_of::<rtattr>() as u16 {
+            break;
+        }
+
+        let payload_offset = offset + std::mem::size_of::<rtattr>();
+        let payload_len = rta.rta_len as usize - std::mem::size_of::<rtattr>();
+
+        if payload_offset + payload_len > data.len() {
+            break;
+        }
+
+        match rta.rta_type {
+            IFA_ADDRESS => {
+                if family == libc::AF_INET as u8 && payload_len == 4 {
+                    let octets: [u8; 4] = data[payload_offset..payload_offset + 4].try_into().unwrap();
+                    *addr_str = Ipv4Addr::from(octets).to_string();
+                } else if family == libc::AF_INET6 as u8 && payload_len == 16 {
+                    let octets: [u8; 16] = data[payload_offset..payload_offset + 16].try_into().unwrap();
+                    *addr_str = Ipv6Addr::from(octets).to_string();
+                }
+            }
+            IFA_LOCAL => {
+                if family == libc::AF_INET as u8 && payload_len == 4 {
+                    let octets: [u8; 4] = data[payload_offset..payload_offset + 4].try_into().unwrap();
+                    *local_str = Ipv4Addr::from(octets).to_string();
+                }
+            }
+            _ => {}
+        }
+
+        // Align to 4-byte boundary
+        let aligned_len = (rta.rta_len as usize + 3) & !3;
+        offset += aligned_len;
+    }
+}
+
+fn add_address_v4(args: &[&str]) {
+    if args.len() < 3 || args[1] != "dev" {
+        eprintln!("Usage: ip addr add <addr/prefix> dev <interface>");
+        return;
+    }
+
+    let addr_str = args[0];
+    let device = args[2];
+
+    let (addr, prefix) = parse_cidr_v4(addr_str);
+
+    if let Err(e) = add_address_internal_v4(addr, prefix, device) {
+        eprintln!("Failed to add address: {}", e);
+    } else {
+        println!("Address added successfully");
+    }
+}
+
+fn add_address_v6(args: &[&str]) {
+    if args.len() < 3 || args[1] != "dev" {
+        eprintln!("Usage: ip -6 addr add <addr/prefix> dev <interface>");
+        return;
+    }
+
+    let addr_str = args[0];
+    let device = args[2];
+
+    let (addr, prefix) = parse_cidr_v6(addr_str);
+
+    if let Err(e) = add_address_internal_v6(addr, prefix, device) {
+        eprintln!("Failed to add address: {}", e);
+    } else {
+        println!("Address added successfully");
+    }
+}
+
+fn del_address_v4(args: &[&str]) {
+    if args.len() < 3 || args[1] != "dev" {
+        eprintln!("Usage: ip addr del <addr/prefix> dev <interface>");
+        return;
+    }
+
+    let addr_str = args[0];
+    let device = args[2];
+
+    let (addr, prefix) = parse_cidr_v4(addr_str);
+
+    if let Err(e) = del_address_internal_v4(addr, prefix, device) {
+        eprintln!("Failed to delete address: {}", e);
+    } else {
+        println!("Address deleted successfully");
+    }
+}
+
+fn del_address_v6(args: &[&str]) {
+    if args.len() < 3 || args[1] != "dev" {
+        eprintln!("Usage: ip -6 addr del <addr/prefix> dev <interface>");
+        return;
+    }
+
+    let addr_str = args[0];
+    let device = args[2];
+
+    let (addr, prefix) = parse_cidr_v6(addr_str);
+
+    if let Err(e) = del_address_internal_v6(addr, prefix, device) {
+        eprintln!("Failed to delete address: {}", e);
+    } else {
+        println!("Address deleted successfully");
+    }
+}
+
+fn add_address_internal_v4(addr: Ipv4Addr, prefix: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx as u32,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    // Build netlink message
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_NEWADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ifa = ifaddrmsg {
+        ifa_family: libc::AF_INET as u8,
+        ifa_prefixlen: prefix,
+        ifa_flags: 0,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: if_index,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ifa as *const ifaddrmsg as *const u8,
+            std::mem::size_of::<ifaddrmsg>(),
+        )
+    });
+
+    // Add IFA_LOCAL and IFA_ADDRESS attributes
+    add_rta_attr(&mut msg, IFA_LOCAL, &addr.octets());
+    add_rta_attr(&mut msg, IFA_ADDRESS, &addr.octets());
+
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
+fn add_address_internal_v6(addr: Ipv6Addr, prefix: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx as u32,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_NEWADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ifa = ifaddrmsg {
+        ifa_family: libc::AF_INET6 as u8,
+        ifa_prefixlen: prefix,
+        ifa_flags: 0,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: if_index,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ifa as *const ifaddrmsg as *const u8,
+            std::mem::size_of::<ifaddrmsg>(),
+        )
+    });
+
+    // Add IFA_ADDRESS attribute (for IPv6, we typically only need IFA_ADDRESS)
+    add_rta_attr(&mut msg, IFA_ADDRESS, &addr.octets());
+
+    // Update message length
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    // Send message
+    send_netlink_message(sock, &msg)?;
+
+    // Receive ACK
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
+fn del_address_internal_v4(addr: Ipv4Addr, prefix: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx as u32,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_DELADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ifa = ifaddrmsg {
+        ifa_family: libc::AF_INET as u8,
+        ifa_prefixlen: prefix,
+        ifa_flags: 0,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: if_index,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ifa as *const ifaddrmsg as *const u8,
+            std::mem::size_of::<ifaddrmsg>(),
+        )
+    });
+
+    add_rta_attr(&mut msg, IFA_LOCAL, &addr.octets());
+    add_rta_attr(&mut msg, IFA_ADDRESS, &addr.octets());
+
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    send_netlink_message(sock, &msg)?;
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
+fn del_address_internal_v6(addr: Ipv6Addr, prefix: u8, device: &str) -> Result<(), String> {
+    let sock = create_netlink_socket()?;
+
+    let if_index = match get_interface_index(device) {
+        Some(idx) => idx as u32,
+        None => return Err(format!("Interface {} not found", device)),
+    };
+
+    let mut msg = Vec::new();
+
+    let nlh = nlmsghdr {
+        nlmsg_len: 0,
+        nlmsg_type: RTM_DELADDR,
+        nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+        nlmsg_seq: 1,
+        nlmsg_pid: 0,
+    };
+
+    let ifa = ifaddrmsg {
+        ifa_family: libc::AF_INET6 as u8,
+        ifa_prefixlen: prefix,
+        ifa_flags: 0,
+        ifa_scope: RT_SCOPE_UNIVERSE,
+        ifa_index: if_index,
+    };
+
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &nlh as *const nlmsghdr as *const u8,
+            std::mem::size_of::<nlmsghdr>(),
+        )
+    });
+    msg.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            &ifa as *const ifaddrmsg as *const u8,
+            std::mem::size_of::<ifaddrmsg>(),
+        )
+    });
+
+    add_rta_attr(&mut msg, IFA_ADDRESS, &addr.octets());
+
+    let msg_len = msg.len() as u32;
+    msg[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+
+    send_netlink_message(sock, &msg)?;
+    receive_netlink_ack(sock)?;
+
+    unsafe { libc::close(sock); }
+    Ok(())
+}
+
 // Netlink helper functions
 
 fn create_netlink_socket() -> Result<i32, String> {
@@ -872,6 +1420,20 @@ fn get_interface_index(iface_name: &str) -> Option<i32> {
     }
 }
 
+fn get_interface_name(if_index: i32) -> Option<String> {
+    let mut buf = [0u8; libc::IFNAMSIZ];
+    let result = unsafe {
+        libc::if_indextoname(if_index as u32, buf.as_mut_ptr() as *mut i8)
+    };
+
+    if result.is_null() {
+        None
+    } else {
+        let name = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8) };
+        Some(name.to_string_lossy().into_owned())
+    }
+}
+
 pub fn help_text() -> &'static str {
-    "ip [OPTIONS] route <COMMAND>      - Show/manipulate routing tables"
+    "ip [OPTIONS] <OBJECT> <COMMAND>   - Show/manipulate routing, addresses (iproute2 syntax)"
 }
