@@ -129,6 +129,45 @@ impl Editor {
         }
     }
 
+    fn kill_line(&mut self) {
+        // Kill from cursor to end of line (Ctrl-K)
+        if self.cursor_row >= self.lines.len() {
+            return;
+        }
+
+        let line = &mut self.lines[self.cursor_row];
+
+        if self.cursor_col < line.len() {
+            // Delete from cursor to end of line
+            line.truncate(self.cursor_col);
+            self.modified = true;
+        } else if self.cursor_row < self.lines.len() - 1 {
+            // At end of line - join with next line (like Ctrl-K in nano)
+            let next_line = self.lines.remove(self.cursor_row + 1);
+            self.lines[self.cursor_row].push_str(&next_line);
+            self.modified = true;
+        }
+    }
+
+    fn move_to_line_start(&mut self) {
+        self.cursor_col = 0;
+
+        // Adjust scroll if needed
+        if self.cursor_col < self.offset_col {
+            self.offset_col = 0;
+        }
+    }
+
+    fn move_to_line_end(&mut self) {
+        let line_len = self.lines.get(self.cursor_row).map(|l| l.len()).unwrap_or(0);
+        self.cursor_col = line_len;
+
+        // Adjust scroll if needed
+        if self.cursor_col >= self.offset_col + self.term_cols {
+            self.offset_col = self.cursor_col.saturating_sub(self.term_cols - 1);
+        }
+    }
+
     fn move_cursor(&mut self, key: char) {
         match key {
             'A' => { // Up
@@ -221,7 +260,7 @@ impl Editor {
 
         // Draw help line at bottom
         print!("\x1b[7m"); // Reverse video
-        let help = " ^S Save | ^Q Quit | ^X Exit ";
+        let help = " ^S Save | ^Q Quit | ^X Exit | ^A Home | ^E End | ^K Cut ";
         print!("{:width$}", help, width = self.term_cols);
         print!("\x1b[0m");
 
@@ -255,6 +294,18 @@ fn run_editor(filename: &str) -> io::Result<()> {
         let ch = buf[0];
 
         match ch {
+            // Ctrl+A - Move to beginning of line
+            1 => {
+                editor.move_to_line_start();
+            }
+            // Ctrl+E - Move to end of line
+            5 => {
+                editor.move_to_line_end();
+            }
+            // Ctrl+K - Kill to end of line
+            11 => {
+                editor.kill_line();
+            }
             // Ctrl+Q - Quit
             17 => {
                 if editor.modified {
