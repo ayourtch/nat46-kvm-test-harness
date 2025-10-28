@@ -47,27 +47,46 @@ This is a custom Rust-based init program (`myinit`) designed to run as PID 1 in 
 
 ## Key Features
 
-### 1. Script-Based System Initialization
+### 1. Three-Stage Initialization System
 
-The program runs as init (PID 1) and executes a **built-in startup script**:
+The program runs as init (PID 1) and uses a **three-stage initialization process**:
+
+#### Stage 1: Minimal Built-in Initialization (Embedded)
+
+A minimal script hardcoded in the binary that only mounts essential filesystems:
 
 ```rust
 let startup_script = r#"
-# Mount filesystems
+# Mount proc filesystem
 mount proc
-ls /
 
-# Load kernel modules
+# Load 9p kernel modules (required for host filesystem access)
 insmod /netfs.ko
 insmod /9pnet.ko
 insmod /9pnet_virtio.ko
 insmod /9p.ko
+
+# Mount host filesystem
+mount 9p
+"#;
+```
+
+**Purpose:** Only mount what's needed to access external scripts.
+
+#### Stage 2: Modifiable System Initialization (startup.run)
+
+After mounting host filesystem, looks for **`startup.run`** in these locations:
+1. `/mnt/host/startup.run` (from host filesystem)
+2. `/startup.run` (from initrd)
+
+**Example startup.run:**
+```bash
+# Example startup.run - Modifiable system initialization
+# Load additional kernel modules
 insmod /nf_defrag_ipv6.ko
 insmod /nat46.ko
 
 # Test nat46 module
-ls /proc/net
-ls /proc/net/nat46
 echo add nat46dev > /proc/net/nat46/control
 
 # Setup TAP interfaces
@@ -76,41 +95,47 @@ tap add tap0
 ifconfig tap0 192.168.1.1 netmask 255.255.255.0
 ifconfig tap0 2001:db8:1::1/64
 ifconfig tap0 up
-tap add tap1
-ifconfig tap1 2001:db8::1/64
-ifconfig tap1 up
-ifconfig
-
-# Mount host filesystem
-mount 9p
-"#;
-
-execute_script(startup_script);
 ```
+
+**Benefits:**
+- Modify without rebuilding initrd
+- Customize test environment on host filesystem
+- Version control with your test code
 
 **Features:**
 - Pure shell-like syntax
 - Comment support (lines starting with `#`)
 - Output redirection support (`>`)
-- Easy to modify without recompilation
+- Full access to all 27 built-in commands
 
-### 2. Auto-Execute Script Support
+#### Stage 3: Test Automation (autoexec.run)
 
-After initialization, the system has a **two-stage countdown**:
+After system initialization (stages 1 & 2), the system has a **two-stage countdown**:
 
-**Stage 1: Autoexec (5 seconds)**
-- Checks for `/autoexec.run` in root directory
+**Countdown 1: Autoexec (5 seconds)**
+- Looks for `autoexec.run` in these locations:
+  - `/mnt/host/autoexec.run` (from host filesystem)
+  - `/autoexec.run` (from initrd)
 - Press any key → skip autoexec, enter interactive mode immediately
-- Timeout → execute `/autoexec.run` if it exists
+- Timeout → execute autoexec.run if it exists
 - If file doesn't exist → print message and continue
 
-**Stage 2: Shutdown (10 seconds) - only if autoexec wasn't skipped**
+**Countdown 2: Shutdown (10 seconds) - only if autoexec wasn't skipped**
 - Press any key → enter interactive mode
 - Timeout → poweroff
 
-This allows users to place custom initialization scripts without recompiling!
+**Example autoexec.run:**
+```bash
+# Automated testing
+echo "Running automated tests..."
+capture start tap0 /tmp/capture.jsonl jsonl 100
+ping 192.168.1.2
+capture stop tap0
+echo "Tests complete"
+poweroff
+```
 
-### 3. Interactive Shell with Powerful Networking Tools
+### 2. Interactive Shell with Powerful Networking Tools
 
 The program provides an interactive shell with **auto-discovered commands** (27 total):
 
@@ -823,6 +848,37 @@ Key parameters:
 - Try manual mount: `mount -t tracefs none /sys/kernel/tracing`
 
 ## Example Workflows
+
+### Customizing System Initialization
+
+Create `startup.run` on your host filesystem to customize the VM environment:
+
+```bash
+# /path/to/nat46-kvm-test-harness/startup.run
+
+# Load kernel modules
+insmod /nf_defrag_ipv6.ko
+insmod /nat46.ko
+
+# Configure NAT46
+echo add nat46dev > /proc/net/nat46/control
+
+# Setup network interfaces
+mknod /dev/net/tun c 10 200
+tap add tap0
+tap add tap1
+ifconfig tap0 192.168.1.1 netmask 255.255.255.0 up
+ifconfig tap1 2001:db8::1/64 up
+
+# Add fake hosts for testing
+fakehost add tap0 192.168.1.10 icmp
+fakehost add tap1 2001:db8::100 icmp router
+
+# Start background monitoring
+droptrace start
+```
+
+This runs automatically after filesystem mount, no need to rebuild initrd!
 
 ### NAT46 Testing with Fake Hosts
 

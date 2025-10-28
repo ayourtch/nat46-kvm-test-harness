@@ -1,0 +1,26 @@
+# Example startup.run - Modifiable system initialization script
+# This file is executed after the host filesystem is mounted
+# Modify this file to customize your test environment
+
+# List root directory to verify mount
+ls /
+
+# Load additional kernel modules
+insmod /nf_defrag_ipv6.ko
+insmod /nat46.ko
+
+# Test nat46 module
+ls /proc/net
+ls /proc/net/nat46
+echo add nat46dev > /proc/net/nat46/control
+
+# Setup TAP interfaces
+mknod /dev/net/tun c 10 200
+tap add tap0
+ifconfig tap0 192.168.1.1 netmask 255.255.255.0
+ifconfig tap0 2001:db8:1::1/64
+ifconfig tap0 up
+tap add tap1
+ifconfig tap1 2001:db8::1/64
+ifconfig tap1 up
+ifconfig

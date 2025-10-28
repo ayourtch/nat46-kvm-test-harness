@@ -240,42 +240,44 @@ fn interactive_shell() {
 }
 
 fn main() {
-    // Startup script - one command per line
+    // Minimal startup script - only what's needed to mount filesystems
     let startup_script = r#"
-# Mount filesystems
+# Mount proc filesystem
 mount proc
-ls /
 
-# Load kernel modules
+# Load 9p kernel modules (required for host filesystem access)
 insmod /netfs.ko
 insmod /9pnet.ko
 insmod /9pnet_virtio.ko
 insmod /9p.ko
-insmod /nf_defrag_ipv6.ko
-insmod /nat46.ko
-
-# Test nat46 module
-ls /proc/net
-ls /proc/net/nat46
-echo add nat46dev > /proc/net/nat46/control
-
-# Setup TAP interfaces
-mknod /dev/net/tun c 10 200
-tap add tap0
-ifconfig tap0 192.168.1.1 netmask 255.255.255.0
-ifconfig tap0 2001:db8:1::1/64
-ifconfig tap0 up
-tap add tap1
-ifconfig tap1 2001:db8::1/64
-ifconfig tap1 up
-ifconfig
 
 # Mount host filesystem
 mount 9p
 "#;
 
-    // Execute the startup script
+    // Execute the minimal startup script
     execute_script(startup_script);
+
+    // Check for and execute startup.run (modifiable initialization script)
+    use std::path::Path;
+    let startup_paths = [
+        "/mnt/host/startup.run",
+        "/startup.run",
+    ];
+
+    let mut found_startup = false;
+    for startup_path in &startup_paths {
+        if Path::new(startup_path).exists() {
+            println!("\nExecuting {}...", startup_path);
+            execute_command("run", startup_path);
+            found_startup = true;
+            break;
+        }
+    }
+
+    if !found_startup {
+        println!("\nNo startup.run found (checked /mnt/host/startup.run, /startup.run), skipping.");
+    }
 
     // First countdown: Check for autoexec.run
     println!("\nChecking for autoexec.run in 5 seconds...");
@@ -303,12 +305,23 @@ mount 9p
 
     if !skip_autoexec {
         // Try to run autoexec.run
-        use std::path::Path;
-        if Path::new("/mnt/host/test-harness/autoexec.run").exists() {
-            println!("\nExecuting /mnt/host/test-harness/autoexec.run...");
-            execute_command("run", "/mnt/host/test-harness/autoexec.run");
-        } else {
-            println!("\nNo /mnt/host/test-harness/autoexec.run found, skipping.");
+        let autoexec_paths = [
+            "/mnt/host/autoexec.run",
+            "/autoexec.run",
+        ];
+
+        let mut found_autoexec = false;
+        for autoexec_path in &autoexec_paths {
+            if Path::new(autoexec_path).exists() {
+                println!("\nExecuting {}...", autoexec_path);
+                execute_command("run", autoexec_path);
+                found_autoexec = true;
+                break;
+            }
+        }
+
+        if !found_autoexec {
+            println!("\nNo autoexec.run found (checked /mnt/host/autoexec.run, /autoexec.run), skipping.");
         }
 
         // Second countdown: Shutdown or interactive mode (only if didn't skip autoexec)
