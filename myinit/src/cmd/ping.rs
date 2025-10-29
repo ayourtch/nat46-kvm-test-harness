@@ -20,11 +20,14 @@ pub fn main(args: &str) {
         4
     };
 
+    // Parse destination and optional scope (e.g., "fe80::1%tap0")
+    let (addr_str, scope_id) = parse_address_with_scope(destination);
+
     // Resolve the destination address
-    let addr = match resolve_address(destination) {
+    let addr = match resolve_address(addr_str) {
         Some(addr) => addr,
         None => {
-            eprintln!("Failed to resolve address: {}", destination);
+            eprintln!("Failed to resolve address: {}", addr_str);
             return;
         }
     };
@@ -33,7 +36,50 @@ pub fn main(args: &str) {
 
     match addr {
         IpAddr::V4(ipv4) => ping_ipv4(ipv4, count),
-        IpAddr::V6(ipv6) => ping_ipv6(ipv6, count),
+        IpAddr::V6(ipv6) => ping_ipv6(ipv6, count, scope_id),
+    }
+}
+
+fn parse_address_with_scope(dest: &str) -> (&str, u32) {
+    // Check for IPv6 zone ID (e.g., "fe80::1%tap0")
+    if let Some(percent_pos) = dest.rfind('%') {
+        let addr_part = &dest[..percent_pos];
+        let iface_part = &dest[percent_pos + 1..];
+
+        // Get interface index
+        let scope_id = get_interface_index(iface_part).unwrap_or(0) as u32;
+
+        if scope_id == 0 {
+            eprintln!("Warning: Interface '{}' not found, using scope_id=0", iface_part);
+        }
+
+        (addr_part, scope_id)
+    } else {
+        (dest, 0)
+    }
+}
+
+fn get_interface_index(iface_name: &str) -> Option<i32> {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return None;
+    }
+
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    let iface_bytes = iface_name.as_bytes();
+    let copy_len = iface_bytes.len().min(libc::IFNAMSIZ - 1);
+
+    for i in 0..copy_len {
+        ifr.ifr_name[i] = iface_bytes[i] as i8;
+    }
+
+    let result = unsafe { libc::ioctl(sock, libc::SIOCGIFINDEX as i32, &mut ifr) };
+    unsafe { libc::close(sock); }
+
+    if result == 0 {
+        Some(unsafe { ifr.ifr_ifru.ifru_ifindex })
+    } else {
+        None
     }
 }
 
@@ -207,7 +253,7 @@ fn recv_icmp_reply(sock: i32, expected_seq: u16) -> Option<f64> {
     }
 }
 
-fn ping_ipv6(dest: std::net::Ipv6Addr, count: usize) {
+fn ping_ipv6(dest: std::net::Ipv6Addr, count: usize, scope_id: u32) {
     let sock = unsafe {
         libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6)
     };
@@ -238,7 +284,7 @@ fn ping_ipv6(dest: std::net::Ipv6Addr, count: usize) {
     for seq in 0..count {
         let start = Instant::now();
 
-        if send_icmpv6_echo(sock, dest, seq as u16) {
+        if send_icmpv6_echo(sock, dest, seq as u16, scope_id) {
             sent += 1;
 
             if let Some(rtt) = recv_icmpv6_reply(sock, seq as u16) {
@@ -265,7 +311,7 @@ fn ping_ipv6(dest: std::net::Ipv6Addr, count: usize) {
         if sent > 0 { (sent - received) as f64 / sent as f64 * 100.0 } else { 0.0 });
 }
 
-fn send_icmpv6_echo(sock: i32, dest: std::net::Ipv6Addr, seq: u16) -> bool {
+fn send_icmpv6_echo(sock: i32, dest: std::net::Ipv6Addr, seq: u16, scope_id: u32) -> bool {
     let mut packet = vec![0u8; 64];
 
     // ICMPv6 header (kernel will calculate checksum for ICMPv6)
@@ -283,7 +329,7 @@ fn send_icmpv6_echo(sock: i32, dest: std::net::Ipv6Addr, seq: u16) -> bool {
         packet[i] = (i & 0xff) as u8;
     }
 
-    // Send packet
+    // Send packet with scope_id for link-local addresses
     let addr = libc::sockaddr_in6 {
         sin6_family: libc::AF_INET6 as u16,
         sin6_port: 0,
@@ -291,7 +337,7 @@ fn send_icmpv6_echo(sock: i32, dest: std::net::Ipv6Addr, seq: u16) -> bool {
         sin6_addr: libc::in6_addr {
             s6_addr: dest.octets(),
         },
-        sin6_scope_id: 0,
+        sin6_scope_id: scope_id,
     };
 
     let result = unsafe {
@@ -372,5 +418,5 @@ fn calculate_checksum(data: &[u8]) -> u16 {
 }
 
 pub fn help_text() -> &'static str {
-    "ping <dest> [count]               - Send ICMP echo requests (IPv4/IPv6)"
+    "ping <dest> [count]               - Send ICMP echo requests (IPv4/IPv6, use fe80::1%iface for link-local)"
 }
