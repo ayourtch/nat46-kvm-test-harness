@@ -5,6 +5,100 @@ use std::time::Duration;
 use std::fs::OpenOptions;
 use std::os::unix::io::AsRawFd;
 use std::io::{self, Write, Read};
+use std::collections::HashMap;
+use std::cell::RefCell;
+
+// Global variable store for shell variables
+thread_local! {
+    static VARIABLES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+fn set_variable(name: &str, value: &str) {
+    VARIABLES.with(|vars| {
+        vars.borrow_mut().insert(name.to_string(), value.to_string());
+    });
+}
+
+fn get_variable(name: &str) -> Option<String> {
+    VARIABLES.with(|vars| {
+        vars.borrow().get(name).cloned()
+    })
+}
+
+fn show_variables() {
+    VARIABLES.with(|vars| {
+        let map = vars.borrow();
+        if map.is_empty() {
+            println!("No variables defined");
+        } else {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                println!("{}={}", key, map[key]);
+            }
+        }
+    });
+}
+
+fn substitute_variables(input: &str) -> String {
+    let mut result = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if chars.peek() == Some(&'{') {
+                // ${VARNAME} syntax
+                chars.next(); // consume '{'
+                let mut var_name = String::new();
+
+                while let Some(&c) = chars.peek() {
+                    if c == '}' {
+                        chars.next(); // consume '}'
+                        break;
+                    }
+                    var_name.push(chars.next().unwrap());
+                }
+
+                if let Some(value) = get_variable(&var_name) {
+                    result.push_str(&value);
+                } else {
+                    // Variable not found, leave as-is
+                    result.push_str("${");
+                    result.push_str(&var_name);
+                    result.push('}');
+                }
+            } else {
+                // $VARNAME syntax (alphanumeric and underscore)
+                let mut var_name = String::new();
+
+                while let Some(&c) = chars.peek() {
+                    if c.is_alphanumeric() || c == '_' {
+                        var_name.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+
+                if !var_name.is_empty() {
+                    if let Some(value) = get_variable(&var_name) {
+                        result.push_str(&value);
+                    } else {
+                        // Variable not found, leave as-is
+                        result.push('$');
+                        result.push_str(&var_name);
+                    }
+                } else {
+                    // Just a lone $
+                    result.push('$');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
 
 fn set_stdin_nonblocking(blocking: bool) {
     unsafe {
@@ -115,6 +209,32 @@ fn execute_command(command: &str, args: &str) -> bool {
 
 // Parse and execute a full command line (supports input and output redirection)
 fn execute_line(line: &str) {
+    // Check if this is a variable assignment (VARNAME=value)
+    // Must not contain spaces before the = and must start with valid var name
+    if let Some(eq_pos) = line.find('=') {
+        let before_eq = &line[..eq_pos];
+
+        // Check if it's a simple variable assignment (no spaces, valid identifier)
+        if !before_eq.contains(char::is_whitespace)
+            && !before_eq.is_empty()
+            && before_eq.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && before_eq.chars().next().map(|c| !c.is_numeric()).unwrap_or(false) {
+
+            let var_name = before_eq;
+            let var_value = &line[eq_pos + 1..];
+
+            // Substitute variables in the value
+            let substituted_value = substitute_variables(var_value);
+
+            set_variable(var_name, &substituted_value);
+            return;
+        }
+    }
+
+    // Perform variable substitution on the entire line
+    let line = substitute_variables(line);
+    let line = line.as_str(); // Convert back to &str for the rest of the function
+
     // Check for input redirection first
     let (cmd_line, input_file) = if let Some(pos) = line.find('<') {
         let cmd = line[..pos].trim();
@@ -142,6 +262,12 @@ fn execute_line(line: &str) {
     let parts: Vec<&str> = cmd_part.splitn(2, ' ').collect();
     let command = parts[0];
     let args = if parts.len() > 1 { parts[1] } else { "" };
+
+    // Handle built-in "env" command to show variables
+    if command == "env" && args.is_empty() {
+        show_variables();
+        return;
+    }
 
     // Handle input redirection
     let input_redirect_info = if let Some(file_path) = input_file {
