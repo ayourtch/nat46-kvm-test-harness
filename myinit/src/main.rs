@@ -261,7 +261,7 @@ mount 9p
     // Check for and execute startup.run (modifiable initialization script)
     use std::path::Path;
     let startup_paths = [
-        "/mnt/host/startup.run",
+        "/mnt/host/test-harness/startup.run",
         "/startup.run",
     ];
 
@@ -276,7 +276,7 @@ mount 9p
     }
 
     if !found_startup {
-        println!("\nNo startup.run found (checked /mnt/host/startup.run, /startup.run), skipping.");
+        println!("\nNo startup.run found (checked /mnt/host/test-harness/startup.run, /startup.run), skipping.");
     }
 
     // First countdown: Check for autoexec.run
@@ -306,7 +306,7 @@ mount 9p
     if !skip_autoexec {
         // Try to run autoexec.run
         let autoexec_paths = [
-            "/mnt/host/autoexec.run",
+            "/mnt/host/test-harness/autoexec.run",
             "/autoexec.run",
         ];
 
@@ -321,7 +321,7 @@ mount 9p
         }
 
         if !found_autoexec {
-            println!("\nNo autoexec.run found (checked /mnt/host/autoexec.run, /autoexec.run), skipping.");
+            println!("\nNo autoexec.run found (checked /mnt/host/test-harness/autoexec.run, /autoexec.run), skipping.");
         }
 
         // Second countdown: Shutdown or interactive mode (only if didn't skip autoexec)
