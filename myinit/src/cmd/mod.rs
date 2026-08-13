@@ -40,6 +40,7 @@ macro_rules! define_commands {
 define_commands! {
     cat,
     capture,
+    cp,
     dmesg,
     droptrace,
     echo,
