@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,15 +41,199 @@ impl CaptureDrain {
     }
 }
 
+fn network_header(packet: &[u8], is_tap: bool) -> Option<(u16, usize)> {
+    if !is_tap {
+        return match packet.first().map(|byte| byte >> 4) {
+            Some(4) => Some((0x0800, 0)),
+            Some(6) => Some((0x86dd, 0)),
+            _ => None,
+        };
+    }
+    if packet.len() < 14 {
+        return None;
+    }
+
+    let mut ether_type = u16::from_be_bytes([packet[12], packet[13]]);
+    let mut offset = 14;
+    while matches!(ether_type, 0x8100 | 0x88a8 | 0x9100) {
+        if packet.len() < offset + 4 {
+            return None;
+        }
+        ether_type = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]);
+        offset += 4;
+    }
+    Some((ether_type, offset))
+}
+
+fn ipv6_upper_layer(packet: &[u8], offset: usize) -> Option<(u8, usize)> {
+    if packet.len() < offset + 40 || packet[offset] >> 4 != 6 {
+        return None;
+    }
+    let mut next_header = packet[offset + 6];
+    let mut cursor = offset + 40;
+
+    loop {
+        match next_header {
+            // Hop-by-Hop Options, Routing, and Destination Options.
+            0 | 43 | 60 => {
+                if packet.len() < cursor + 2 {
+                    return None;
+                }
+                next_header = packet[cursor];
+                let length = (packet[cursor + 1] as usize + 1) * 8;
+                if packet.len() < cursor + length {
+                    return None;
+                }
+                cursor += length;
+            }
+            // Valid Neighbor Discovery messages are not fragmented. Keep
+            // fragmented ICMPv6 visible rather than classifying it as ND.
+            44 => return None,
+            // Authentication Header length is measured in 32-bit words,
+            // excluding the first two words.
+            51 => {
+                if packet.len() < cursor + 2 {
+                    return None;
+                }
+                next_header = packet[cursor];
+                let length = (packet[cursor + 1] as usize + 2) * 4;
+                if packet.len() < cursor + length {
+                    return None;
+                }
+                cursor += length;
+            }
+            _ => return Some((next_header, cursor)),
+        }
+    }
+}
+
+fn is_neighbor_discovery(packet: &[u8], is_tap: bool) -> bool {
+    let Some((ether_type, offset)) = network_header(packet, is_tap) else {
+        return false;
+    };
+    if ether_type != 0x86dd || packet.len() < offset + 40 {
+        return false;
+    }
+    // RFC 4861 requires received ND packets to have IPv6 Hop Limit 255.
+    if packet[offset + 7] != 255 {
+        return false;
+    }
+    let Some((next_header, upper_offset)) = ipv6_upper_layer(packet, offset) else {
+        return false;
+    };
+    next_header == 58
+        && packet.len() >= upper_offset + 2
+        && matches!(packet[upper_offset], 133..=137)
+        && packet[upper_offset + 1] == 0
+}
+
+fn should_ignore_packet(packet: &[u8], is_tap: bool, ignored: &[CaptureIgnore]) -> bool {
+    ignored.iter().any(|item| match item {
+        CaptureIgnore::NeighborDiscovery => is_neighbor_discovery(packet, is_tap),
+        CaptureIgnore::Arp => {
+            matches!(network_header(packet, is_tap), Some((0x0806, _)))
+        }
+    })
+}
+
 // Global state for managing captures
 lazy_static::lazy_static! {
     static ref CAPTURES: Arc<Mutex<HashMap<String, CaptureHandle>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CaptureFormat {
     Jsonl,
     Pcap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureIgnore {
+    NeighborDiscovery,
+    Arp,
+}
+
+impl CaptureIgnore {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "nd" => Some(Self::NeighborDiscovery),
+            "arp" => Some(Self::Arp),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::NeighborDiscovery => "nd",
+            Self::Arp => "arp",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CaptureOptions {
+    format: CaptureFormat,
+    max_packets: Option<u64>,
+    ignored: Vec<CaptureIgnore>,
+}
+
+fn parse_start_options(parts: &[&str]) -> Result<CaptureOptions, String> {
+    let mut options = CaptureOptions {
+        format: CaptureFormat::Jsonl,
+        max_packets: None,
+        ignored: vec![CaptureIgnore::NeighborDiscovery],
+    };
+
+    for part in parts {
+        match *part {
+            "jsonl" => options.format = CaptureFormat::Jsonl,
+            "pcap" => options.format = CaptureFormat::Pcap,
+            _ => {
+                if let Ok(count) = part.parse::<u64>() {
+                    if options.max_packets.replace(count).is_some() {
+                        return Err("packet count specified more than once".to_string());
+                    }
+                    continue;
+                }
+
+                let names = part
+                    .strip_prefix("ignore=")
+                    .or_else(|| part.strip_prefix("--ignore="));
+                if let Some(names) = names {
+                    if names.is_empty() {
+                        return Err("ignore list must not be empty".to_string());
+                    }
+                    for name in names.split(',') {
+                        let ignored = CaptureIgnore::parse(name)
+                            .ok_or_else(|| format!("unknown capture ignore class {:?}", name))?;
+                        if !options.ignored.contains(&ignored) {
+                            options.ignored.push(ignored);
+                        }
+                    }
+                    continue;
+                }
+
+                let names = part
+                    .strip_prefix("include=")
+                    .or_else(|| part.strip_prefix("--include="));
+                if let Some(names) = names {
+                    if names.is_empty() {
+                        return Err("include list must not be empty".to_string());
+                    }
+                    for name in names.split(',') {
+                        let included = CaptureIgnore::parse(name)
+                            .ok_or_else(|| format!("unknown capture include class {:?}", name))?;
+                        options.ignored.retain(|item| *item != included);
+                    }
+                    continue;
+                }
+
+                return Err(format!("unknown capture option {:?}", part));
+            }
+        }
+    }
+
+    Ok(options)
 }
 
 struct CaptureHandle {
@@ -58,6 +243,7 @@ struct CaptureHandle {
     thread_handle: Option<JoinHandle<()>>,
     packets_captured: Arc<Mutex<u64>>,
     max_packets: Option<u64>,
+    ignored: Vec<CaptureIgnore>,
 }
 
 pub fn main(args: &str) {
@@ -65,7 +251,7 @@ pub fn main(args: &str) {
 
     if parts.is_empty() {
         eprintln!("Usage:");
-        eprintln!("  capture start <iface> <file> [jsonl|pcap] [count]  - Start capturing packets");
+        eprintln!("  capture start <iface> <file> [jsonl|pcap] [count] [include=nd] [ignore=arp]");
         eprintln!(
             "  capture stop <iface>                                - Stop capture on interface"
         );
@@ -77,41 +263,24 @@ pub fn main(args: &str) {
     match parts[0] {
         "start" => {
             if parts.len() < 3 {
-                eprintln!("Usage: capture start <iface> <file> [jsonl|pcap] [count]");
+                eprintln!("Usage: capture start <iface> <file> [jsonl|pcap] [count] [include=nd] [ignore=arp]");
                 eprintln!("  Format defaults to jsonl if not specified");
                 eprintln!("  Count is optional packet limit");
+                eprintln!("  Neighbor Discovery is ignored by default; include=nd captures it");
+                eprintln!("  Ignore/include classes apply before counting packets");
                 return;
             }
             let iface = parts[1];
             let file = parts[2];
-
-            // Parse optional format and count
-            let mut format = CaptureFormat::Jsonl;
-            let mut count = None;
-
-            if parts.len() > 3 {
-                // Check if part[3] is a format or count
-                match parts[3] {
-                    "jsonl" => {
-                        format = CaptureFormat::Jsonl;
-                        if parts.len() > 4 {
-                            count = parts[4].parse::<u64>().ok();
-                        }
-                    }
-                    "pcap" => {
-                        format = CaptureFormat::Pcap;
-                        if parts.len() > 4 {
-                            count = parts[4].parse::<u64>().ok();
-                        }
-                    }
-                    _ => {
-                        // Try to parse as count
-                        count = parts[3].parse::<u64>().ok();
-                    }
+            let options = match parse_start_options(&parts[3..]) {
+                Ok(options) => options,
+                Err(error) => {
+                    eprintln!("Invalid capture options: {}", error);
+                    return;
                 }
-            }
+            };
 
-            start_capture(iface, file, format, count);
+            start_capture(iface, file, options);
         }
         "stop" => {
             if parts.len() < 2 {
@@ -134,7 +303,7 @@ pub fn main(args: &str) {
     }
 }
 
-fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_packets: Option<u64>) {
+fn start_capture(iface: &str, output_file: &str, options: CaptureOptions) {
     let mut captures = CAPTURES.lock().unwrap();
 
     // Check if already capturing on this interface
@@ -153,6 +322,10 @@ fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_pack
     let packets_captured_clone = Arc::clone(&packets_captured);
     let iface_clone = iface_owned.clone();
     let output_clone = output_file_owned.clone();
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    let format = options.format;
+    let max_packets = options.max_packets;
+    let ignored_for_thread = options.ignored.clone();
 
     // Spawn capture thread
     let thread_handle = thread::spawn(move || {
@@ -163,8 +336,30 @@ fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_pack
             stop_flag_clone,
             packets_captured_clone,
             max_packets,
+            ignored_for_thread,
+            ready_sender,
         );
     });
+
+    // Do not let the caller inject packets until the capture socket is bound.
+    // This replaces timing delays in callers with an explicit readiness
+    // handshake and closes the packet-loss race at capture startup.
+    match ready_receiver.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("Failed to start capture on {}: {}", iface, error);
+            let _ = thread_handle.join();
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "Failed to start capture on {}: capture thread exited",
+                iface
+            );
+            let _ = thread_handle.join();
+            return;
+        }
+    }
 
     // Store capture handle
     captures.insert(
@@ -176,6 +371,7 @@ fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_pack
             thread_handle: Some(thread_handle),
             packets_captured,
             max_packets,
+            ignored: options.ignored.clone(),
         },
     );
 
@@ -184,8 +380,21 @@ fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_pack
         CaptureFormat::Pcap => "pcap",
     };
 
+    let ignored = if options.ignored.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (ignoring: {})",
+            options
+                .ignored
+                .iter()
+                .map(|item| item.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     println!(
-        "Started capture on {} -> {} (format: {}) {}",
+        "Started capture on {} -> {} (format: {}) {}{}",
         iface,
         output_file,
         format_str,
@@ -193,7 +402,8 @@ fn start_capture(iface: &str, output_file: &str, format: CaptureFormat, max_pack
             format!("(max {} packets)", count)
         } else {
             "(unlimited)".to_string()
-        }
+        },
+        ignored,
     );
 }
 
@@ -244,10 +454,10 @@ fn show_captures() {
 
     println!("\nActive captures:");
     println!(
-        "{:<15} {:<30} {:<8} {:<12} {}",
-        "Interface", "Output File", "Format", "Packets", "Limit"
+        "{:<15} {:<30} {:<8} {:<12} {:<10} {}",
+        "Interface", "Output File", "Format", "Packets", "Limit", "Ignoring"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(96));
 
     for (iface, handle) in captures.iter() {
         let count = *handle.packets_captured.lock().unwrap();
@@ -260,9 +470,15 @@ fn show_captures() {
             CaptureFormat::Jsonl => "jsonl",
             CaptureFormat::Pcap => "pcap",
         };
+        let ignored = handle
+            .ignored
+            .iter()
+            .map(|item| item.name())
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "{:<15} {:<30} {:<8} {:<12} {}",
-            iface, handle.output_file, format_str, count, limit_str
+            "{:<15} {:<30} {:<8} {:<12} {:<10} {}",
+            iface, handle.output_file, format_str, count, limit_str, ignored
         );
     }
 }
@@ -274,6 +490,8 @@ fn capture_thread(
     stop_flag: Arc<AtomicBool>,
     packets_captured: Arc<Mutex<u64>>,
     max_packets: Option<u64>,
+    ignored: Vec<CaptureIgnore>,
+    ready_sender: mpsc::Sender<Result<(), String>>,
 ) {
     // Detect if interface is TAP (layer 2) or TUN (layer 3) by checking BROADCAST flag
     let is_tap = is_interface_tap(iface);
@@ -287,7 +505,10 @@ fn capture_thread(
     let mut file = match File::create(output_file) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Failed to create output file {}: {}", output_file, e);
+            let _ = ready_sender.send(Err(format!(
+                "could not create output file {}: {}",
+                output_file, e
+            )));
             return;
         }
     };
@@ -295,7 +516,7 @@ fn capture_thread(
     // Write pcap header if needed
     if matches!(format, CaptureFormat::Pcap) {
         if let Err(e) = write_pcap_header(&mut file) {
-            eprintln!("Failed to write pcap header: {}", e);
+            let _ = ready_sender.send(Err(format!("could not write pcap header: {}", e)));
             return;
         }
     }
@@ -310,7 +531,7 @@ fn capture_thread(
     };
 
     if sock < 0 {
-        eprintln!("Failed to create raw socket for capture on {}", iface);
+        let _ = ready_sender.send(Err("could not create raw capture socket".to_string()));
         return;
     }
 
@@ -318,10 +539,10 @@ fn capture_thread(
     let if_index = match get_interface_index(iface) {
         Some(idx) => idx,
         None => {
-            eprintln!("Failed to get interface index for {}", iface);
             unsafe {
                 libc::close(sock);
             }
+            let _ = ready_sender.send(Err("could not get interface index".to_string()));
             return;
         }
     };
@@ -346,10 +567,10 @@ fn capture_thread(
     };
 
     if bind_result < 0 {
-        eprintln!("Failed to bind socket to interface {}", iface);
         unsafe {
             libc::close(sock);
         }
+        let _ = ready_sender.send(Err("could not bind raw socket to interface".to_string()));
         return;
     }
 
@@ -358,6 +579,10 @@ fn capture_thread(
         let flags = libc::fcntl(sock, libc::F_GETFL, 0);
         libc::fcntl(sock, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+
+    // The socket is now able to receive packets. Only now may `capture start`
+    // return to the script that will produce the traffic under test.
+    let _ = ready_sender.send(Ok(()));
 
     let mut buffer = vec![0u8; 65536]; // Max packet size
     let mut count = 0u64;
@@ -412,6 +637,9 @@ fn capture_thread(
 
         let packet_len = result as usize;
         if packet_len == 0 {
+            continue;
+        }
+        if should_ignore_packet(&buffer[..packet_len], is_tap, &ignored) {
             continue;
         }
         drain.observe_packet(Instant::now());
@@ -622,6 +850,99 @@ pub fn help_text() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn icmpv6_packet(type_: u8, code: u8, hop_limit: u8) -> Vec<u8> {
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+        packet[6] = 58;
+        packet[7] = hop_limit;
+        packet[40] = type_;
+        packet[41] = code;
+        packet
+    }
+
+    #[test]
+    fn capture_options_ignore_neighbor_discovery_by_default() {
+        let options = parse_start_options(&[]).unwrap();
+
+        assert_eq!(options.format, CaptureFormat::Jsonl);
+        assert_eq!(options.max_packets, None);
+        assert_eq!(options.ignored, vec![CaptureIgnore::NeighborDiscovery]);
+    }
+
+    #[test]
+    fn capture_options_can_include_neighbor_discovery() {
+        let options = parse_start_options(&["pcap", "12", "include=nd", "ignore=arp"]).unwrap();
+
+        assert_eq!(options.format, CaptureFormat::Pcap);
+        assert_eq!(options.max_packets, Some(12));
+        assert_eq!(options.ignored, vec![CaptureIgnore::Arp]);
+    }
+
+    #[test]
+    fn capture_options_reject_unknown_filter_classes() {
+        let error = parse_start_options(&["ignore=all"]).unwrap_err();
+
+        assert!(error.contains("unknown capture ignore class"));
+    }
+
+    #[test]
+    fn neighbor_discovery_filter_is_narrow() {
+        let ignored = [CaptureIgnore::NeighborDiscovery];
+
+        assert!(should_ignore_packet(
+            &icmpv6_packet(135, 0, 255),
+            false,
+            &ignored
+        ));
+        assert!(!should_ignore_packet(
+            &icmpv6_packet(128, 0, 255),
+            false,
+            &ignored
+        ));
+        assert!(!should_ignore_packet(
+            &icmpv6_packet(1, 0, 255),
+            false,
+            &ignored
+        ));
+        assert!(!should_ignore_packet(
+            &icmpv6_packet(135, 1, 255),
+            false,
+            &ignored
+        ));
+        assert!(!should_ignore_packet(
+            &icmpv6_packet(135, 0, 64),
+            false,
+            &ignored
+        ));
+    }
+
+    #[test]
+    fn neighbor_discovery_filter_handles_ethernet() {
+        let mut frame = vec![0u8; 14];
+        frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        frame.extend(icmpv6_packet(136, 0, 255));
+
+        assert!(should_ignore_packet(
+            &frame,
+            true,
+            &[CaptureIgnore::NeighborDiscovery]
+        ));
+    }
+
+    #[test]
+    fn arp_filter_is_explicit() {
+        let mut frame = vec![0u8; 42];
+        frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+
+        assert!(!should_ignore_packet(
+            &frame,
+            true,
+            &[CaptureIgnore::NeighborDiscovery]
+        ));
+        assert!(should_ignore_packet(&frame, true, &[CaptureIgnore::Arp]));
+    }
 
     #[test]
     fn capture_drain_waits_for_quiet_period_after_stop() {
