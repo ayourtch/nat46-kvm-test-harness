@@ -380,3 +380,61 @@ fn read_pcap_packet(file: &mut File, is_little_endian: bool) -> Result<Packet, S
 pub fn help_text() -> &'static str {
     "inject <file> <iface>            - Replay packets from PCAP/JSONL file to interface"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_jsonl_line;
+
+    #[test]
+    fn jsonl_preserves_explicit_udp_length() {
+        let json = r#"{
+            "timestamp_us": 1,
+            "layers": [
+                {
+                    "layertype": "ether",
+                    "dst": "0E:86:3C:CD:51:CA",
+                    "src": "52:55:0A:00:02:02",
+                    "etype": 2048
+                },
+                {
+                    "layertype": "Ip",
+                    "version": 4,
+                    "ihl": 5,
+                    "tos": 0,
+                    "len": 36,
+                    "id": 1,
+                    "flags": {
+                        "reserved": false,
+                        "dont_fragment": false,
+                        "more_fragments": false,
+                        "fragment_offset": 0
+                    },
+                    "ttl": 255,
+                    "proto": 17,
+                    "chksum": 59819,
+                    "src": "192.168.1.100",
+                    "dst": "8.8.8.8",
+                    "options": []
+                },
+                {
+                    "layertype": "Udp",
+                    "sport": 5353,
+                    "dport": 5354,
+                    "len": 12,
+                    "chksum": 45460
+                },
+                {
+                    "layertype": "raw",
+                    "data": [41, 41, 41, 41, 99, 99, 99, 99]
+                }
+            ]
+        }"#;
+
+        let packet = parse_jsonl_line(json).expect("packet should encode");
+
+        assert_eq!(u16::from_be_bytes([packet.data[16], packet.data[17]]), 36);
+        assert_eq!(u16::from_be_bytes([packet.data[38], packet.data[39]]), 12);
+        assert_eq!(u16::from_be_bytes([packet.data[40], packet.data[41]]), 45460);
+        assert_eq!(&packet.data[42..], &[41, 41, 41, 41, 99, 99, 99, 99]);
+    }
+}
