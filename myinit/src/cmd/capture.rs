@@ -1,10 +1,44 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const CAPTURE_STOP_IDLE: Duration = Duration::from_millis(50);
+const CAPTURE_STOP_MAX: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct CaptureDrain {
+    started_at: Option<Instant>,
+    quiet_since: Option<Instant>,
+}
+
+impl CaptureDrain {
+    fn observe_stop(&mut self, stop_requested: bool, now: Instant) {
+        if stop_requested && self.started_at.is_none() {
+            self.started_at = Some(now);
+            self.quiet_since = Some(now);
+        }
+    }
+
+    fn observe_packet(&mut self, now: Instant) {
+        if self.started_at.is_some() {
+            self.quiet_since = Some(now);
+        }
+    }
+
+    fn is_complete(&self, now: Instant) -> bool {
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
+        let quiet_since = self.quiet_since.unwrap_or(started_at);
+
+        now.saturating_duration_since(quiet_since) >= CAPTURE_STOP_IDLE
+            || now.saturating_duration_since(started_at) >= CAPTURE_STOP_MAX
+    }
+}
 
 // Global state for managing captures
 lazy_static::lazy_static! {
@@ -32,7 +66,9 @@ pub fn main(args: &str) {
     if parts.is_empty() {
         eprintln!("Usage:");
         eprintln!("  capture start <iface> <file> [jsonl|pcap] [count]  - Start capturing packets");
-        eprintln!("  capture stop <iface>                                - Stop capture on interface");
+        eprintln!(
+            "  capture stop <iface>                                - Stop capture on interface"
+        );
         eprintln!("  capture stop all                                    - Stop all captures");
         eprintln!("  capture show                                        - Show active captures");
         return;
@@ -207,7 +243,10 @@ fn show_captures() {
     }
 
     println!("\nActive captures:");
-    println!("{:<15} {:<30} {:<8} {:<12} {}", "Interface", "Output File", "Format", "Packets", "Limit");
+    println!(
+        "{:<15} {:<30} {:<8} {:<12} {}",
+        "Interface", "Output File", "Format", "Packets", "Limit"
+    );
     println!("{}", "-".repeat(80));
 
     for (iface, handle) in captures.iter() {
@@ -280,7 +319,9 @@ fn capture_thread(
         Some(idx) => idx,
         None => {
             eprintln!("Failed to get interface index for {}", iface);
-            unsafe { libc::close(sock); }
+            unsafe {
+                libc::close(sock);
+            }
             return;
         }
     };
@@ -306,7 +347,9 @@ fn capture_thread(
 
     if bind_result < 0 {
         eprintln!("Failed to bind socket to interface {}", iface);
-        unsafe { libc::close(sock); }
+        unsafe {
+            libc::close(sock);
+        }
         return;
     }
 
@@ -318,11 +361,18 @@ fn capture_thread(
 
     let mut buffer = vec![0u8; 65536]; // Max packet size
     let mut count = 0u64;
+    let mut drain = CaptureDrain::default();
 
     // Capture loop
     loop {
-        // Check stop flag
-        if stop_flag.load(Ordering::SeqCst) {
+        // A packet sent through a virtual interface can still be queued for
+        // receive processing when the injector returns.  Once stop is
+        // requested, keep reading for a short quiet period so those packets
+        // are not lost at the capture boundary.  The hard limit prevents
+        // continuous traffic from delaying shutdown indefinitely.
+        let now = Instant::now();
+        drain.observe_stop(stop_flag.load(Ordering::SeqCst), now);
+        if drain.is_complete(now) {
             break;
         }
 
@@ -364,29 +414,28 @@ fn capture_thread(
         if packet_len == 0 {
             continue;
         }
+        drain.observe_packet(Instant::now());
 
         // Determine packet direction
         // PACKET_OUTGOING = 4, PACKET_HOST = 0
-        let direction = if sll.sll_pkttype == 4 {
-            "tx"
-        } else {
-            "rx"
-        };
+        let direction = if sll.sll_pkttype == 4 { "tx" } else { "rx" };
 
         // Get timestamp
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
         // Write packet in appropriate format
         let write_result = match format {
             CaptureFormat::Jsonl => {
-                let json_line = packet_to_jsonl(&buffer[..packet_len], timestamp.as_micros(), count, is_tap, direction);
+                let json_line = packet_to_jsonl(
+                    &buffer[..packet_len],
+                    timestamp.as_micros(),
+                    count,
+                    is_tap,
+                    direction,
+                );
                 writeln!(file, "{}", json_line)
             }
-            CaptureFormat::Pcap => {
-                write_pcap_packet(&mut file, &buffer[..packet_len], timestamp)
-            }
+            CaptureFormat::Pcap => write_pcap_packet(&mut file, &buffer[..packet_len], timestamp),
         };
 
         if let Err(e) = write_result {
@@ -403,7 +452,9 @@ fn capture_thread(
         *packets_captured.lock().unwrap() = count;
     }
 
-    unsafe { libc::close(sock); }
+    unsafe {
+        libc::close(sock);
+    }
 }
 
 fn get_interface_index(iface_name: &str) -> Option<i32> {
@@ -421,7 +472,9 @@ fn get_interface_index(iface_name: &str) -> Option<i32> {
     }
 
     let result = unsafe { libc::ioctl(sock, libc::SIOCGIFINDEX as i32, &mut ifr) };
-    unsafe { libc::close(sock); }
+    unsafe {
+        libc::close(sock);
+    }
 
     if result == 0 {
         Some(unsafe { ifr.ifr_ifru.ifru_ifindex })
@@ -445,7 +498,9 @@ fn is_interface_tap(iface_name: &str) -> bool {
     }
 
     let result = unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as i32, &mut ifr) };
-    unsafe { libc::close(sock); }
+    unsafe {
+        libc::close(sock);
+    }
 
     if result == 0 {
         let flags = unsafe { ifr.ifr_ifru.ifru_flags };
@@ -456,7 +511,13 @@ fn is_interface_tap(iface_name: &str) -> bool {
     }
 }
 
-fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64, is_tap: bool, direction: &str) -> String {
+fn packet_to_jsonl(
+    packet: &[u8],
+    timestamp_us: u128,
+    _seq: u64,
+    is_tap: bool,
+    direction: &str,
+) -> String {
     use oside::protocols::all::*;
     use oside::*;
 
@@ -485,9 +546,7 @@ fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64, is_tap: bool, d
         Some(l) => l,
         None => {
             // If parsing fails, fallback to hex encoding
-            let hex_data: String = packet.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
+            let hex_data: String = packet.iter().map(|b| format!("{:02x}", b)).collect();
             return format!(
                 r#"{{"timestamp_us":{},"direction":"{}","data":"{}"}}"#,
                 timestamp_us, direction, hex_data
@@ -500,9 +559,7 @@ fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64, is_tap: bool, d
         Ok(j) => j,
         Err(_) => {
             // Fallback to hex if serialization fails
-            let hex_data: String = packet.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect();
+            let hex_data: String = packet.iter().map(|b| format!("{:02x}", b)).collect();
             return format!(
                 r#"{{"timestamp_us":{},"direction":"{}","data":"{}"}}"#,
                 timestamp_us, direction, hex_data
@@ -510,7 +567,10 @@ fn packet_to_jsonl(packet: &[u8], timestamp_us: u128, _seq: u64, is_tap: bool, d
         }
     };
 
-    format!(r#"{{"timestamp_us":{},"direction":"{}","layers":{}}}"#, timestamp_us, direction, layers_json)
+    format!(
+        r#"{{"timestamp_us":{},"direction":"{}","layers":{}}}"#,
+        timestamp_us, direction, layers_json
+    )
 }
 
 // PCAP file format functions
@@ -518,13 +578,13 @@ fn write_pcap_header(file: &mut File) -> std::io::Result<()> {
     // PCAP Global Header (24 bytes)
     // https://wiki.wireshark.org/Development/LibpcapFileFormat
 
-    let magic_number: u32 = 0xa1b2c3d4;  // Microsecond resolution
+    let magic_number: u32 = 0xa1b2c3d4; // Microsecond resolution
     let version_major: u16 = 2;
     let version_minor: u16 = 4;
-    let thiszone: i32 = 0;               // GMT to local correction
-    let sigfigs: u32 = 0;                // Accuracy of timestamps
-    let snaplen: u32 = 65535;            // Max length of captured packets
-    let network: u32 = 1;                // Data link type (1 = Ethernet)
+    let thiszone: i32 = 0; // GMT to local correction
+    let sigfigs: u32 = 0; // Accuracy of timestamps
+    let snaplen: u32 = 65535; // Max length of captured packets
+    let network: u32 = 1; // Data link type (1 = Ethernet)
 
     file.write_all(&magic_number.to_le_bytes())?;
     file.write_all(&version_major.to_le_bytes())?;
@@ -541,8 +601,8 @@ fn write_pcap_packet(file: &mut File, packet: &[u8], timestamp: Duration) -> std
     // PCAP Packet Header (16 bytes)
     let ts_sec = timestamp.as_secs() as u32;
     let ts_usec = timestamp.subsec_micros() as u32;
-    let incl_len = packet.len() as u32;  // Number of octets saved
-    let orig_len = packet.len() as u32;  // Actual length of packet
+    let incl_len = packet.len() as u32; // Number of octets saved
+    let orig_len = packet.len() as u32; // Actual length of packet
 
     file.write_all(&ts_sec.to_le_bytes())?;
     file.write_all(&ts_usec.to_le_bytes())?;
@@ -557,4 +617,45 @@ fn write_pcap_packet(file: &mut File, packet: &[u8], timestamp: Duration) -> std
 
 pub fn help_text() -> &'static str {
     "capture <start|stop|show>          - Capture packets to JSONL/PCAP file"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_drain_waits_for_quiet_period_after_stop() {
+        let start = Instant::now();
+        let mut drain = CaptureDrain::default();
+
+        drain.observe_stop(true, start);
+
+        assert!(!drain.is_complete(start));
+        assert!(!drain.is_complete(start + CAPTURE_STOP_IDLE / 2));
+        assert!(drain.is_complete(start + CAPTURE_STOP_IDLE));
+    }
+
+    #[test]
+    fn capture_drain_extends_quiet_period_after_packet() {
+        let start = Instant::now();
+        let packet_time = start + CAPTURE_STOP_IDLE / 2;
+        let mut drain = CaptureDrain::default();
+
+        drain.observe_stop(true, start);
+        drain.observe_packet(packet_time);
+
+        assert!(!drain.is_complete(start + CAPTURE_STOP_IDLE));
+        assert!(drain.is_complete(packet_time + CAPTURE_STOP_IDLE));
+    }
+
+    #[test]
+    fn capture_drain_has_hard_shutdown_limit() {
+        let start = Instant::now();
+        let mut drain = CaptureDrain::default();
+
+        drain.observe_stop(true, start);
+        drain.observe_packet(start + CAPTURE_STOP_MAX - Duration::from_millis(1));
+
+        assert!(drain.is_complete(start + CAPTURE_STOP_MAX));
+    }
 }
