@@ -1,20 +1,16 @@
+use std::ffi::CString;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::ffi::CString;
 use std::path::Path;
 
 // MODULE_INIT_COMPRESSED_FILE flag for finit_module
 const MODULE_INIT_COMPRESSED_FILE: i32 = 4;
 
 pub fn main(args: &str) {
-    let args = args.trim();
-
-    if args.is_empty() {
-        eprintln!("Usage: insmod <module_path>");
+    let Some((requested_path, params)) = parse_args(args) else {
+        eprintln!("Usage: insmod FILE [SYMBOL=VALUE]...");
         return;
-    }
-
-    let requested_path = args;
+    };
 
     // Determine which file to use (.ko or .ko.zst)
     let (actual_path, is_compressed) = find_module_file(requested_path);
@@ -27,7 +23,7 @@ pub fn main(args: &str) {
 
     let module_path = actual_path.unwrap();
 
-    match insmod_internal(&module_path, is_compressed) {
+    match insmod_internal(&module_path, is_compressed, params) {
         Ok(_) => {
             println!("Successfully loaded module: {}", module_path);
         }
@@ -43,6 +39,20 @@ pub fn main(args: &str) {
             }
         }
     }
+}
+
+/* Match BusyBox's `insmod FILE [SYMBOL=VALUE]...` interface.  The command
+ * dispatcher gives us the unparsed remainder of the line, while finit_module
+ * expects one space-separated option string. */
+fn parse_args(args: &str) -> Option<(&str, &str)> {
+    let mut fields = args.trim().splitn(2, char::is_whitespace);
+    let requested_path = fields.next()?;
+
+    if requested_path.is_empty() {
+        return None;
+    }
+
+    Some((requested_path, fields.next().unwrap_or("").trim()))
 }
 
 fn find_module_file(requested_path: &str) -> (Option<String>, bool) {
@@ -76,13 +86,14 @@ fn find_module_file(requested_path: &str) -> (Option<String>, bool) {
     (None, false)
 }
 
-fn insmod_internal(module_path: &str, is_compressed: bool) -> Result<(), String> {
+fn insmod_internal(module_path: &str, is_compressed: bool, params: &str) -> Result<(), String> {
     // Open the kernel module file
-    let file = File::open(module_path)
-        .map_err(|e| format!("Failed to open {}: {}", module_path, e))?;
+    let file =
+        File::open(module_path).map_err(|e| format!("Failed to open {}: {}", module_path, e))?;
 
     let fd = file.as_raw_fd();
-    let params = CString::new("").unwrap();
+    let params =
+        CString::new(params).map_err(|_| "Module options contain a NUL byte".to_string())?;
 
     // Set flags based on whether the module is compressed
     let flags = if is_compressed {
@@ -92,9 +103,7 @@ fn insmod_internal(module_path: &str, is_compressed: bool) -> Result<(), String>
     };
 
     // Use finit_module syscall (syscall number 313 on x86_64)
-    let result = unsafe {
-        libc::syscall(libc::SYS_finit_module, fd, params.as_ptr(), flags)
-    };
+    let result = unsafe { libc::syscall(libc::SYS_finit_module, fd, params.as_ptr(), flags) };
 
     if result == 0 {
         Ok(())
@@ -108,14 +117,16 @@ fn insmod_internal(module_path: &str, is_compressed: bool) -> Result<(), String>
                 .into_owned()
         };
 
-        Err(format!("insmod failed with return code: {} (errno: {} - {})",
-                    result, errno, error_msg))
+        Err(format!(
+            "insmod failed with return code: {} (errno: {} - {})",
+            result, errno, error_msg
+        ))
     }
 }
 
 fn read_recent_kmsg(lines: usize) -> Result<Vec<String>, String> {
-    use std::io::{BufRead, BufReader};
     use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
     // Try to read from /dev/kmsg (preferred) or /proc/kmsg
     let kmsg_paths = ["/dev/kmsg", "/proc/kmsg"];
@@ -139,5 +150,36 @@ fn read_recent_kmsg(lines: usize) -> Result<Vec<String>, String> {
 }
 
 pub fn help_text() -> &'static str {
-    "insmod <module>                   - Load kernel module (.ko or .ko.zst)"
+    "insmod FILE [SYMBOL=VALUE]...     - Load kernel module (.ko or .ko.zst)"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    #[test]
+    fn parses_a_path_without_options() {
+        assert_eq!(parse_args(" /nat46.ko "), Some(("/nat46.ko", "")));
+    }
+
+    #[test]
+    fn preserves_busybox_style_module_options() {
+        assert_eq!(
+            parse_args("/nat46.ko print_stats_on_destroy=1 debug=4"),
+            Some(("/nat46.ko", "print_stats_on_destroy=1 debug=4"))
+        );
+    }
+
+    #[test]
+    fn accepts_whitespace_between_the_path_and_options() {
+        assert_eq!(
+            parse_args("\t/nat46.ko\t  answer=42  name=value \n"),
+            Some(("/nat46.ko", "answer=42  name=value"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_command() {
+        assert_eq!(parse_args("  \t\n"), None);
+    }
 }
